@@ -16,12 +16,14 @@ static NSString * const kLogoShaders =
     @"#include <metal_stdlib>\n"
     "using namespace metal;\n"
     "struct Vin  { float3 pos [[attribute(0)]]; float3 nrm [[attribute(1)]]; float2 uv [[attribute(2)]]; };\n"
-    "struct Vout { float4 pos [[position]]; float3 nrm; float2 uv; };\n"
+    "struct Vout { float4 pos [[position]]; float clip_dist [[clip_distance]]; float3 nrm; float2 uv; };\n"
     "struct Uni  { float4x4 model; float4x4 vp; };\n"
     "vertex Vout logo_vert(Vin in [[stage_in]], constant Uni &u [[buffer(1)]]) {\n"
     "    float4 wPos = u.model * float4(in.pos, 1.0);\n"
+    "    float4 cp = u.vp * wPos;\n"
     "    Vout o;\n"
-    "    o.pos = u.vp * wPos;\n"
+    "    o.pos = cp;\n"
+    "    o.clip_dist = cp.z;\n"  // negative → closer than near plane → clipped
     "    float3x3 rot = float3x3(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz);\n"
     "    o.nrm = rot * in.nrm;\n"
     "    o.uv  = in.uv;\n"
@@ -513,8 +515,12 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     }
 
     // ── View-projection matrix ──
+    // Original engine: near=0.06, far=60.0, zoom=kShapeCameraZoom=0.5
+    // WR zoom = tan(half_horizontal_FOV); fovY = 2*atan(zoom/aspect)
     float aspect = (float)(sz.width / sz.height);
-    simd_float4x4 proj = logo_mat_perspective(M_PI / 4.0, aspect, 0.01f, 500.f);
+    float wrZoom = 0.5f;
+    float fovY   = 2.f * atanf(wrZoom / aspect);
+    simd_float4x4 proj = logo_mat_perspective(fovY, aspect, 0.06f, 60.f);
     simd_float4x4 view = logo_mat_lookAt(camEye, camLook, simd_make_float3(0,1,0));
     simd_float4x4 vp   = simd_mul(proj, view);
 
