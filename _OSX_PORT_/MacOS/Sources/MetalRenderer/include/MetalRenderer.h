@@ -5,3 +5,8 @@
 @interface LeahView : NSView
 - (instancetype)initWithFrame:(NSRect)frame;
 @end
+
+// WaterRace Logo Intro cinematic renderer
+@interface LogoIntroView : NSView
+- (instancetype)initWithFrame:(NSRect)frame;
+@end

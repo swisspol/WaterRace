@@ -11,12 +11,12 @@ let window = NSWindow(
     backing: .buffered,
     defer: false
 )
-window.title = "WaterRace – Leah"
+window.title = "WaterRace – Logo Intro"
 window.center()
 
-let leahView = LeahView(frame: window.contentView!.bounds)!
-leahView.autoresizingMask = [.width, .height]
-window.contentView = leahView
+let logoView = LogoIntroView(frame: window.contentView!.bounds)!
+logoView.autoresizingMask = [.width, .height]
+window.contentView = logoView
 
 window.makeKeyAndOrderFront(nil)
 app.activate(ignoringOtherApps: true)
