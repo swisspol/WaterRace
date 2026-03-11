@@ -13,6 +13,7 @@ let package = Package(
                 .linkedFramework("Metal"),
                 .linkedFramework("QuartzCore"),
                 .linkedFramework("CoreVideo"),
+                .linkedFramework("ImageIO"),
                 .linkedFramework("AppKit"),
             ]
         ),

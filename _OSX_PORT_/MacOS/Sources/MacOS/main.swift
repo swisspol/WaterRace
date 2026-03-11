@@ -10,12 +10,12 @@ let window = NSWindow(
     backing: .buffered,
     defer: false
 )
-window.title = "WaterRace"
+window.title = "WaterRace – Leah"
 window.center()
 
-let metalView = MetalView(frame: window.contentView!.bounds)!
-metalView.autoresizingMask = [.width, .height]
-window.contentView = metalView
+let leahView = LeahView(frame: window.contentView!.bounds)!
+leahView.autoresizingMask = [.width, .height]
+window.contentView = leahView
 
 window.makeKeyAndOrderFront(nil)
 app.activate(ignoringOtherApps: true)
