@@ -93,18 +93,36 @@ static simd_float4x4 logo_mat_lookAt(simd_float3 eye, simd_float3 ctr, simd_floa
 
 // ── Quaternion helpers ─────────────────────────────────────────────────────────
 
-// Linear lerp + sign-flip (matches WR Quaternion_LerpInterpolation)
+// Normalize a raw quaternion; treat all-zero (identity stored as 0,0,0,0) as (1,0,0,0).
+static void logo_quat_normalize(float w, float x, float y, float z,
+                                 float *rw, float *rx, float *ry, float *rz)
+{
+    float sq = w*w + x*x + y*y + z*z;
+    if (sq > 0.0f) {
+        float inv = 1.0f / sqrtf(sq);
+        *rw = w*inv; *rx = x*inv; *ry = y*inv; *rz = z*inv;
+    } else {
+        *rw = 1.0f; *rx = *ry = *rz = 0.0f;   // all-zero → identity
+    }
+}
+
+// Linear lerp + sign-flip (matches WR Quaternion_LerpInterpolation).
+// Pre-normalizes both quaternions so that all-zero keyframes (stored identity)
+// lerp smoothly toward/from non-zero rotations.
 static void logo_quat_lerp(LogoKF *a, LogoKF *b, float t,
                             float *rw, float *rx, float *ry, float *rz)
 {
-    float cosom = a->qx*b->qx + a->qy*b->qy + a->qz*b->qz + a->qw*b->qw;
-    float bw = b->qw, bx = b->qx, by = b->qy, bz = b->qz;
+    float aw, ax, ay, az, bw, bx, by, bz;
+    logo_quat_normalize(a->qw, a->qx, a->qy, a->qz, &aw, &ax, &ay, &az);
+    logo_quat_normalize(b->qw, b->qx, b->qy, b->qz, &bw, &bx, &by, &bz);
+
+    float cosom = ax*bx + ay*by + az*bz + aw*bw;
     if (cosom < 0.0f) { bw=-bw; bx=-bx; by=-by; bz=-bz; }
     float s0 = 1.0f-t, s1 = t;
-    *rw = s0*a->qw + s1*bw;
-    *rx = s0*a->qx + s1*bx;
-    *ry = s0*a->qy + s1*by;
-    *rz = s0*a->qz + s1*bz;
+    *rw = s0*aw + s1*bw;
+    *rx = s0*ax + s1*bx;
+    *ry = s0*ay + s1*by;
+    *rz = s0*az + s1*bz;
 }
 
 // Quaternion + translation → Metal column-major 4x4
