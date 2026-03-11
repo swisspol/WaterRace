@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:WaterRace}/_OSX_PORT_/MacOS",
+            "name": "Debug MacOS (_OSX_PORT_/MacOS)",
+            "target": "MacOS",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug MacOS (_OSX_PORT_/MacOS)"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:WaterRace}/_OSX_PORT_/MacOS",
+            "name": "Release MacOS (_OSX_PORT_/MacOS)",
+            "target": "MacOS",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release MacOS (_OSX_PORT_/MacOS)"
+        }
+    ]
+}

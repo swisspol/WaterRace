@@ -1,5 +1,6 @@
 .DS_Store
+.venv
 __pycache__
-/_OSX_PORT_/.venv
+.build
 /_OSX_PORT_/textures
 /_OSX_PORT_/models
