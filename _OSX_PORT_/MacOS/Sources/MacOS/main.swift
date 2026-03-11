@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import MetalRenderer
 
 let app = NSApplication.shared
@@ -43,6 +44,15 @@ NotificationCenter.default.addObserver(
     object: window,
     queue: .main
 ) { _ in NSApp.terminate(nil) }
+
+var player: AVAudioPlayer?
+let musicURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    .appendingPathComponent("Music.mp3")
+if let p = try? AVAudioPlayer(contentsOf: musicURL) {
+    p.numberOfLoops = -1
+    p.play()
+    player = p
+}
 
 let delegate = AppDelegate()
 app.delegate = delegate
