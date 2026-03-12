@@ -398,7 +398,7 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 
 - (BOOL)loadAssets {
     NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
-    NSString *adir = [cwd stringByAppendingPathComponent:@"LogoAssets"];
+    NSString *adir = [cwd stringByAppendingPathComponent:@"Assets"];
     NSString *path = [adir stringByAppendingPathComponent:@"Logo Intro"];
     NSData *data   = [NSData dataWithContentsOfFile:path];
     if (!data) { NSLog(@"LogoIntroRenderer: 'Logo Intro' MetaFile not found at %@", path); return NO; }
@@ -719,7 +719,7 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 
 - (void)loadLeahAssets {
     NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
-    NSString *path = [[cwd stringByAppendingPathComponent:@"LeahAssets"]
+    NSString *path = [[cwd stringByAppendingPathComponent:@"Assets"]
                            stringByAppendingPathComponent:@"Leah"];
     NSData *data = [NSData dataWithContentsOfFile:path];
     if (!data) { NSLog(@"Leah: MetaFile not found at %@", path); return; }
@@ -1073,7 +1073,7 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
 - (void)loadGBoatAssets {
     NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
-    NSString *path = [[cwd stringByAppendingPathComponent:@"GBoatAssets"]
+    NSString *path = [[cwd stringByAppendingPathComponent:@"Assets"]
                            stringByAppendingPathComponent:@"G-Boat"];
     NSData *data = [NSData dataWithContentsOfFile:path];
     if (!data) { NSLog(@"GBoat: MetaFile not found at %@", path); return; }
