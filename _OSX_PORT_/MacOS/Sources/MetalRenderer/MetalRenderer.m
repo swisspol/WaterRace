@@ -37,6 +37,22 @@ static NSString * const kLogoShaders =
     "    float3 L = normalize(float3(0.6, 1.0, 0.8));\n"
     "    float  d = max(0.0f, dot(normalize(in.nrm), L));\n"
     "    return float4(c.rgb * (0.35f + 0.65f * d), c.a);\n"
+    "}\n"
+    // Lens flare: screen-space quad, unlit, intensity-modulated, additive blend
+    "vertex Vout lens_vert(Vin in [[stage_in]], constant float4x4 &mdl [[buffer(1)]]) {\n"
+    "    Vout o;\n"
+    "    o.pos = mdl * float4(in.pos, 1.0);\n"
+    "    o.clip_dist = 1.0;\n"  // always pass clip test
+    "    o.nrm = in.nrm;\n"
+    "    o.uv  = in.uv;\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 lens_frag(Vout in [[stage_in]],\n"
+    "                          texture2d<float> tex [[texture(0)]],\n"
+    "                          constant float &intensity [[buffer(2)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    float3 c = tex.sample(s, in.uv).rgb;\n"
+    "    return float4(c, 1.0);\n"  // no intensity scaling; additive blend handles brightness
     "}\n";
 
 // ── Uniform structs ────────────────────────────────────────────────────────────
@@ -162,9 +178,19 @@ typedef struct {
     uint8_t       shape_id[4];
     uint8_t       tex_id[4];
     uint32_t      index_count;
+    uint16_t      shading;     // original shading mode; >= 16 → additive (lens/sprite)
     simd_float4x4 init_mat;    // initial pose (used before animation starts)
     simd_float4x4 model_mat;   // updated per frame by animation
 } LogoShapeData;
+
+// ── Lens flare element (kShader_Lens, shading==19) ────────────────────────────
+typedef struct {
+    uint8_t  tex_id[4];
+    float    size;        // fraction of screen height (e.g. 0.35 = 35%)
+    float    offset;      // position along center→light line (1=at light, 0=center, -1=opposite)
+    float    intensity;   // brightness multiplier for additive blend
+    float    lightX, lightY, lightZ;  // world-space light source position
+} LensData;
 
 // ── Per-animation CPU data ─────────────────────────────────────────────────────
 typedef struct {
@@ -426,6 +452,7 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
 
 // ── Logo scene ─────────────────────────────────────────────────────────────────
 @property id<MTLRenderPipelineState>  logoPipeline;
+@property id<MTLRenderPipelineState>  logoPipelineAdditive;  // additive blend for lens/sprite shapes
 @property NSUInteger                  shapeCount;
 @property NSMutableArray<id<MTLBuffer>> *vertexBufs;
 @property NSMutableArray<id<MTLBuffer>> *indexBufs;
@@ -437,6 +464,13 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
 @property float                       sceneCx, sceneCy, sceneCz, sceneRadius;
 @property uint32_t                    scriptLengthCs;
 @property NSDate                     *startTime;
+// Lens flares
+@property id<MTLRenderPipelineState>  lensPipeline;
+@property id<MTLDepthStencilState>    depthStateDisabled;  // no depth test/write for flares
+@property id<MTLBuffer>               lensQuadVtxBuf;
+@property id<MTLBuffer>               lensQuadIdxBuf;
+@property NSUInteger                  lensCount;
+@property LensData                   *lenses;  // malloc'd
 
 // ── 3D model pipeline (shared by all rotating model scenes) ───────────────────
 @property id<MTLRenderPipelineState>  modelPipeline;
@@ -730,10 +764,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         if (eBase + i * 24 + 24 > len) break;
         if (mf_4cc(e + 4, "shap")) {
             int32_t spos = mf_s32(e + 20);
-            if (spos >= 0 && (NSUInteger)spos + 228 <= len) {
-                uint16_t shading = (uint16_t)(b[spos+226]<<8 | b[spos+227]);
-                if (shading < 16) shapeCount++;
-            }
+            if (spos >= 0 && (NSUInteger)spos + 228 <= len) shapeCount++;
         } else if (mf_4cc(e + 4, "<-->") && mf_4cc(e + 8, "anim")) {
             int32_t apos = mf_s32(e + 20);
             if (apos >= 0 && (NSUInteger)apos + 12 <= len && mf_4cc(b + apos + 8, "anim"))
@@ -758,7 +789,6 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         const uint8_t *sh = b + spos;
 
         uint16_t shading = (uint16_t)(sh[226]<<8 | sh[227]);
-        if (shading >= 16) continue;   // FX / sprite shape
 
         int32_t pc = mf_s32(sh + 0);
         int32_t tc = mf_s32(sh + 8);
@@ -847,6 +877,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         LogoShapeData *sd = &_shapes[shapIdx];
         memcpy(sd->shape_id, sh + 296, 4);  // shape id at header +296
         memcpy(sd->tex_id,   sh + 200, 4);  // texture id at header +200
+        sd->shading     = shading;
         sd->index_count = (uint32_t)tc * 3;
         // Init matrix: WR row-major [4][3] → Metal column-major 4x4
         float m[4][3];
@@ -866,6 +897,50 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         shapIdx++;
     }
     _shapeCount = shapIdx;
+
+    // ── Pass 2b: parse kShader_Lens (shading==19) flare elements ──────────
+    // Count first, then fill
+    uint32_t lensCount = 0;
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "shap")) continue;
+        int32_t spos = mf_s32(e + 20);
+        if (spos < 0 || (NSUInteger)spos + 228 > len) continue;
+        if (((uint16_t)(b[spos+226]<<8|b[spos+227])) == 19) lensCount++;
+    }
+    _lensCount = 0;
+    _lenses    = calloc(lensCount ? lensCount : 1, sizeof(LensData));
+    for (uint32_t i = 0; i < tagCount && _lensCount < lensCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "shap")) continue;
+        int32_t spos = mf_s32(e + 20);
+        if (spos < 0 || (NSUInteger)spos + 228 > len) continue;
+        if (((uint16_t)(b[spos+226]<<8|b[spos+227])) != 19) continue;
+        LensData *ld = &_lenses[_lensCount++];
+        memcpy(ld->tex_id, b + spos + 200, 4);
+        // Find shdt child tag
+        uint8_t cdepth = e[0] + 1;
+        for (uint32_t j = i + 1; j < tagCount; ++j) {
+            const uint8_t *ce = b + eBase + j * 24;
+            if (eBase + j * 24 + 24 > len || ce[0] < cdepth) break;
+            if (!mf_4cc(ce + 4, "<-->") || !mf_4cc(ce + 8, "shdt")) continue;
+            int32_t cpos = mf_s32(ce + 20), csz = mf_s32(ce + 16);
+            if (cpos < 0 || csz < 28 || (NSUInteger)cpos + 28 > len) break;
+            ld->size      = mf_f32(b + cpos +  0);
+            ld->offset    = mf_f32(b + cpos +  4);
+            ld->intensity = mf_f32(b + cpos +  8);
+            // byte 12 = int flag; light position at bytes 16..24
+            ld->lightX    = mf_f32(b + cpos + 16);
+            ld->lightY    = mf_f32(b + cpos + 20);
+            ld->lightZ    = mf_f32(b + cpos + 24);
+            break;
+        }
+        char tid[5] = { ld->tex_id[0], ld->tex_id[1], ld->tex_id[2], ld->tex_id[3], 0 };
+        NSLog(@"  Lens '%s': size=%.2f offset=%.2f intensity=%.3f light=(%.0f,%.0f,%.0f)",
+              tid, ld->size, ld->offset, ld->intensity, ld->lightX, ld->lightY, ld->lightZ);
+    }
 
     // ── Pass 3: parse kType_Animation animations ───────────────────────────
     uint32_t animIdx = 0;
@@ -997,10 +1072,41 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
     _logoPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!_logoPipeline) { NSLog(@"LogoIntro pipeline error: %@", err); return NO; }
 
+    // Additive pipeline for lens/sprite shapes (shading >= 16)
+    pd.colorAttachments[0].blendingEnabled             = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor        = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor   = MTLBlendFactorOne;
+    pd.colorAttachments[0].sourceAlphaBlendFactor      = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+    _logoPipelineAdditive = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!_logoPipelineAdditive) { NSLog(@"LogoIntro additive pipeline error: %@", err); return NO; }
+
+    // Lens flare pipeline: uses lens_vert/lens_frag with additive blend (blending already set)
+    pd.vertexFunction  = [lib newFunctionWithName:@"lens_vert"];
+    pd.fragmentFunction= [lib newFunctionWithName:@"lens_frag"];
+    _lensPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!_lensPipeline) { NSLog(@"Lens pipeline error: %@", err); return NO; }
+
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
     dd.depthCompareFunction = MTLCompareFunctionLess;
     dd.depthWriteEnabled    = YES;
     _depthState = [_device newDepthStencilStateWithDescriptor:dd];
+
+    MTLDepthStencilDescriptor *ddOff = [MTLDepthStencilDescriptor new];
+    ddOff.depthCompareFunction = MTLCompareFunctionAlways;
+    ddOff.depthWriteEnabled    = NO;
+    _depthStateDisabled = [_device newDepthStencilStateWithDescriptor:ddOff];
+
+    // Unit quad for lens flare rendering (positions in [-0.5, 0.5], UV (0,0)=top-left)
+    float quadV[4 * 8] = {
+        -0.5f,  0.5f, 0.f,  0.f, 0.f, 1.f,  0.f, 0.f,  // TL
+         0.5f,  0.5f, 0.f,  0.f, 0.f, 1.f,  1.f, 0.f,  // TR
+        -0.5f, -0.5f, 0.f,  0.f, 0.f, 1.f,  0.f, 1.f,  // BL
+         0.5f, -0.5f, 0.f,  0.f, 0.f, 1.f,  1.f, 1.f,  // BR
+    };
+    uint32_t quadI[6] = { 0, 1, 2,  1, 3, 2 };
+    _lensQuadVtxBuf = [_device newBufferWithBytes:quadV length:sizeof(quadV) options:0];
+    _lensQuadIdxBuf = [_device newBufferWithBytes:quadI length:sizeof(quadI) options:0];
     return YES;
 }
 
@@ -1830,12 +1936,14 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-    [enc setRenderPipelineState:_logoPipeline];
     [enc setDepthStencilState:_depthState];
-    [enc setCullMode:MTLCullModeBack];
+    [enc setCullMode:MTLCullModeNone];  // flares are double-sided quads; None works for all
     [enc setFrontFacingWinding:MTLWindingClockwise];
 
+    // Pass 1: solid shapes (shading < 16)
+    [enc setRenderPipelineState:_logoPipeline];
     for (NSUInteger i = 0; i < _shapeCount; ++i) {
+        if (_shapes[i].shading >= 16) continue;
         if (memcmp(_shapes[i].shape_id, "camr", 4) == 0) continue;
         LogoUni uni = { .model = _shapes[i].model_mat, .vp = vp };
         id<MTLTexture> tex = _whiteTex;
@@ -1854,6 +1962,49 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
                        indexBuffer:_indexBufs[i]
                  indexBufferOffset:0];
     }
+
+    // Pass 3: lens flare elements (screen-space quads, additive, no depth test)
+    if (_lensCount > 0 && _lensPipeline && _lensQuadVtxBuf) {
+        // Project light source to NDC (all lens elements share the same light position)
+        simd_float4 lclip = simd_mul(vp, (simd_float4){
+            _lenses[0].lightX, _lenses[0].lightY, _lenses[0].lightZ, 1.f });
+        if (lclip.w > 0.0001f) {
+            float lnx = lclip.x / lclip.w;
+            float lny = lclip.y / lclip.w;
+            float aspect = (float)(sz.width / sz.height);
+            [enc setRenderPipelineState:_lensPipeline];
+            [enc setDepthStencilState:_depthStateDisabled];
+            [enc setVertexBuffer:_lensQuadVtxBuf offset:0 atIndex:0];
+            for (NSUInteger li = 0; li < _lensCount; ++li) {
+                LensData *ld = &_lenses[li];
+                // Element center in NDC: offset along center(0,0) → light direction
+                float cx = ld->offset * lnx;
+                float cy = ld->offset * lny;
+                // Size as fraction of screen height, in NDC units (range = 2)
+                float sx = ld->size * 2.f / aspect;
+                float sy = ld->size * 2.f;
+                // Model matrix: scale then translate in clip/NDC space (VP = identity)
+                simd_float4x4 mdl = (simd_float4x4){ .columns = {
+                    { sx,   0.f, 0.f, 0.f },
+                    { 0.f,  sy,  0.f, 0.f },
+                    { 0.f,  0.f, 1.f, 0.f },
+                    { cx,   cy,  0.5f, 1.f },
+                }};
+                NSData *key = [NSData dataWithBytes:ld->tex_id length:4];
+                id<MTLTexture> tex = _texMap[key] ?: _whiteTex;
+                float intensity = ld->intensity;
+                [enc setVertexBytes:&mdl       length:sizeof(mdl)       atIndex:1];
+                [enc setFragmentBytes:&intensity length:sizeof(intensity) atIndex:2];
+                [enc setFragmentTexture:tex atIndex:0];
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:6
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:_lensQuadIdxBuf
+                         indexBufferOffset:0];
+            }
+        }
+    }
+
     [enc endEncoding];
     [cmd presentDrawable:drawable];
     [cmd commit];
@@ -1971,6 +2122,7 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
         free(_anims[i].events);
     free(_shapes);
     free(_anims);
+    free(_lenses);
 }
 
 @end
