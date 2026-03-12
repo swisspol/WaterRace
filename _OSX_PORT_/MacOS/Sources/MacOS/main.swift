@@ -5,10 +5,10 @@ import MetalRenderer
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 
+let args = CommandLine.arguments.dropFirst()
+let isTest = args.contains("-test")
 let validModes: Set<String> = ["characters", "boats", "levels"]
-let mode: String? = CommandLine.arguments.dropFirst().first.flatMap {
-    validModes.contains($0) ? $0 : nil
-}
+let mode: String? = args.first(where: { validModes.contains($0) })
 
 let titles = ["characters": "WaterRace – Characters",
                "boats":      "WaterRace – Boats",
@@ -63,6 +63,10 @@ if let p = try? AVAudioPlayer(contentsOf: musicURL) {
     p.numberOfLoops = -1
     p.play()
     player = p
+}
+
+if isTest {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 5) { NSApp.terminate(nil) }
 }
 
 let delegate = AppDelegate()
