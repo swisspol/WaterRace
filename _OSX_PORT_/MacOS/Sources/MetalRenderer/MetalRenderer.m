@@ -41,31 +41,54 @@ static NSString * const kLogoShaders =
 
 // ── Uniform structs ────────────────────────────────────────────────────────────
 typedef struct { simd_float4x4 model; simd_float4x4 vp; } LogoUni;
-typedef struct { simd_float4x4 mvp;   simd_float4x4 rotY; } LeahUni;
-
-// ── Per-shape data for multi-shape rotating models (G-Boat, etc.) ─────────────
+// ── Per-shape data for rotating models ───────────────────────────────────────
 typedef struct {
     uint8_t  tex_id[4];
     uint32_t index_count;
 } ModelShapeData;
 
-// ── Leah shaders ───────────────────────────────────────────────────────────────
-static NSString * const kLeahShaders =
+// ── Loaded 3D MetaFile model ───────────────────────────────────────────────────
+@interface MetaModel : NSObject
+@property NSMutableArray<id<MTLBuffer>> *vertexBufs;
+@property NSMutableArray<id<MTLBuffer>> *indexBufs;
+@property NSMutableDictionary<NSData *, id<MTLTexture>> *texMap;
+@property NSUInteger    shapeCount;
+@property ModelShapeData *shapes;   // malloc'd; freed in dealloc
+@property simd_float3   center;
+@property float         diameter;
+@property float         angle;      // current rotation angle (updated each frame)
+@end
+
+@implementation MetaModel
+- (instancetype)init {
+    if (!(self = [super init])) return nil;
+    _vertexBufs = [NSMutableArray new];
+    _indexBufs  = [NSMutableArray new];
+    _texMap     = [NSMutableDictionary new];
+    return self;
+}
+- (void)dealloc { free(_shapes); }
+@end
+
+// ── Model shaders (float3 pos, float3 nrm, float2 uv; rotates around Y) ───────
+typedef struct { simd_float4x4 mvp; simd_float4x4 rotY; } ModelUni;
+
+static NSString * const kModelShaders =
     @"#include <metal_stdlib>\n"
     "using namespace metal;\n"
-    "struct LVin  { float3 pos [[attribute(0)]]; float3 nrm [[attribute(1)]]; float2 uv [[attribute(2)]]; };\n"
-    "struct LVout { float4 pos [[position]]; float3 nrm; float2 uv; };\n"
-    "struct LUni  { float4x4 mvp; float4x4 rotY; };\n"
-    "vertex LVout leah_vert(LVin in [[stage_in]], constant LUni &u [[buffer(1)]]) {\n"
-    "    LVout o;\n"
+    "struct MVin  { float3 pos [[attribute(0)]]; float3 nrm [[attribute(1)]]; float2 uv [[attribute(2)]]; };\n"
+    "struct MVout { float4 pos [[position]]; float3 nrm; float2 uv; };\n"
+    "struct MUni  { float4x4 mvp; float4x4 rotY; };\n"
+    "vertex MVout model_vert(MVin in [[stage_in]], constant MUni &u [[buffer(1)]]) {\n"
+    "    MVout o;\n"
     "    o.pos = u.mvp  * float4(in.pos, 1.0);\n"
     "    o.nrm = (u.rotY * float4(in.nrm, 0.0)).xyz;\n"
     "    o.uv  = in.uv;\n"
     "    return o;\n"
     "}\n"
-    "fragment float4 leah_frag(LVout in [[stage_in]],\n"
-    "                          texture2d<float> tex [[texture(0)]],\n"
-    "                          constant LUni &u [[buffer(1)]]) {\n"
+    "fragment float4 model_frag(MVout in [[stage_in]],\n"
+    "                           texture2d<float> tex [[texture(0)]],\n"
+    "                           constant MUni &u [[buffer(1)]]) {\n"
     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
     "    float4 c = tex.sample(s, in.uv);\n"
     "    float3 L = normalize(float3(0.6, 1.0, 0.8));\n"
@@ -295,25 +318,12 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 @property uint32_t                    scriptLengthCs;
 @property NSDate                     *startTime;
 
-// ── Leah scene ─────────────────────────────────────────────────────────────────
-@property id<MTLRenderPipelineState>  leahPipeline;
-@property id<MTLBuffer>               leahVertexBuf;
-@property id<MTLBuffer>               leahIndexBuf;
-@property id<MTLTexture>              leahTexture;
-@property uint32_t                    leahIndexCount;
-@property simd_float3                 leahCenter;
-@property float                       leahDiameter;
-@property float                       leahAngle;
+// ── 3D model pipeline (shared by all rotating model scenes) ───────────────────
+@property id<MTLRenderPipelineState>  modelPipeline;
 
-// ── G-Boat scene ───────────────────────────────────────────────────────────────
-@property NSMutableArray<id<MTLBuffer>> *gboatVertexBufs;
-@property NSMutableArray<id<MTLBuffer>> *gboatIndexBufs;
-@property NSMutableDictionary<NSData *, id<MTLTexture>> *gboatTexMap;
-@property NSUInteger                  gboatShapeCount;
-@property ModelShapeData             *gboatShapes;   // malloc'd
-@property simd_float3                 gboatCenter;
-@property float                       gboatDiameter;
-@property float                       gboatAngle;
+// ── Rotating model scenes ──────────────────────────────────────────────────────
+@property MetaModel                  *leahModel;
+@property MetaModel                  *gboatModel;
 
 // ── Scene state (0=logo, 1=leah, 2=gboat) ─────────────────────────────────────
 @property NSInteger                   scene;
@@ -332,18 +342,17 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     _metalLayer.pixelFormat  = MTLPixelFormatBGRA8Unorm;
     _metalLayer.drawableSize = CGSizeMake(frame.size.width * 2, frame.size.height * 2);
 
-    _commandQueue    = [_device newCommandQueue];
-    _vertexBufs      = [NSMutableArray new];
-    _indexBufs       = [NSMutableArray new];
-    _texMap          = [NSMutableDictionary new];
-    _gboatVertexBufs = [NSMutableArray new];
-    _gboatIndexBufs  = [NSMutableArray new];
-    _gboatTexMap     = [NSMutableDictionary new];
+    _commandQueue = [_device newCommandQueue];
+    _vertexBufs   = [NSMutableArray new];
+    _indexBufs    = [NSMutableArray new];
+    _texMap       = [NSMutableDictionary new];
 
     if (![self loadAssets] || ![self buildPipeline]) return nil;
-    [self loadLeahAssets];    // best-effort
-    [self loadGBoatAssets];   // best-effort
-    [self buildLeahPipeline]; // shared pipeline for Leah + G-Boat
+    [self buildModelPipeline];
+    NSString *assets = [NSFileManager.defaultManager.currentDirectoryPath
+                        stringByAppendingPathComponent:@"Assets"];
+    _leahModel  = [self loadModelFromPath:[assets stringByAppendingPathComponent:@"Leah"]];
+    _gboatModel = [self loadModelFromPath:[assets stringByAppendingPathComponent:@"G-Boat"]];
 
     _startTime = [NSDate date];
     CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
@@ -705,193 +714,202 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     return YES;
 }
 
-// ── Leah asset loading (direct MetaFile parse) ────────────────────────────────
-// MetaFile format: big-endian, tag table at offset 8 of header.
-// Tag table: uint32 count, then count × 24-byte entries:
-//   [0] u8 depth, [1] u8 flags, [2-3] i16 version,
-//   [4-7] OSType tag, [8-11] OSType subtag, [12-15] OSType id,
-//   [16-19] i32 dataSize, [20-23] i32 dataPos
-// Shape header at dataPos: 300 bytes (see prepare_leah.py for field layout).
-// Vertex (pnts):  6 big-endian floats = x,y,z,u,v,c  (24 bytes each)
-// Normal (nrls):  3 big-endian floats = nx,ny,nz      (12 bytes each)
-// Triangle (trig):3 big-endian uint32 = a,b,c         (12 bytes each)
-// Texture (cptx/txim): PICT v2 data containing a CompressedQuickTime JPEG
+// ── 3D MetaFile model loader ─────────────────────────────────────────────────
+// Parses any WaterRace MetaFile: builds per-shape vertex/index buffers
+// (positions/normals transformed into model space) and extracts JPEG textures.
 
-- (void)loadLeahAssets {
-    NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
-    NSString *path = [[cwd stringByAppendingPathComponent:@"Assets"]
-                           stringByAppendingPathComponent:@"Leah"];
+- (nullable MetaModel *)loadModelFromPath:(NSString *)path {
     NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data) { NSLog(@"Leah: MetaFile not found at %@", path); return; }
+    if (!data) { NSLog(@"MetaModel: not found at %@", path); return nil; }
 
     const uint8_t *b   = data.bytes;
     NSUInteger     len = data.length;
-    if (len < 16) return;
+    if (len < 16) return nil;
 
-    // ── Tag table ──────────────────────────────────────────────────────────────
     int32_t  ttPos    = mf_s32(b + 8);
     uint32_t tagCount = mf_u32(b + ttPos);
-    NSUInteger eBase  = ttPos + 4;   // base of 24-byte entry array
+    NSUInteger eBase  = (NSUInteger)ttPos + 4;
 
-    // ── Find shap + its geometry subtags, and cptx texture ────────────────────
-    int32_t shapIdx = -1;
-    int32_t pntsIdx = -1, trigIdx = -1, nrlsIdx = -1;
-    int32_t cptxIdx = -1, tximIdx = -1;
+    // Count renderable shapes (shading < 16)
+    uint32_t shapeCount = 0;
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "shap")) continue;
+        int32_t spos = mf_s32(e + 20);
+        if (spos >= 0 && (NSUInteger)spos + 228 <= len) {
+            uint16_t shading = (uint16_t)(b[spos+226]<<8 | b[spos+227]);
+            if (shading < 16) shapeCount++;
+        }
+    }
+    if (shapeCount == 0) { NSLog(@"MetaModel: no renderable shapes in %@", path); return nil; }
+
+    MetaModel *model = [MetaModel new];
+    model.shapes = calloc(shapeCount, sizeof(ModelShapeData));
+
+    // Parse each shape
+    uint32_t shapIdx = 0;
+    float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
+    float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
 
     for (uint32_t i = 0; i < tagCount; ++i) {
         const uint8_t *e = b + eBase + i * 24;
         if (eBase + i * 24 + 24 > len) break;
-        const uint8_t *tag = e + 4, *sub = e + 8;
+        if (!mf_4cc(e + 4, "shap")) continue;
 
-        if (shapIdx < 0 && mf_4cc(tag, "shap"))                                         shapIdx = i;
-        if (shapIdx >= 0 && pntsIdx < 0 && mf_4cc(tag, "<-->") && mf_4cc(sub, "pnts")) pntsIdx = i;
-        if (shapIdx >= 0 && trigIdx < 0 && mf_4cc(tag, "<-->") && mf_4cc(sub, "trig")) trigIdx = i;
-        if (shapIdx >= 0 && nrlsIdx < 0 && mf_4cc(tag, "<-->") && mf_4cc(sub, "nrls")) nrlsIdx = i;
-        if (cptxIdx < 0 && mf_4cc(tag, "cptx"))                                         cptxIdx = i;
-        if (cptxIdx >= 0 && tximIdx < 0 && mf_4cc(tag, "<-->") && mf_4cc(sub, "txim")) tximIdx = i;
-    }
-    if (shapIdx < 0 || pntsIdx < 0 || trigIdx < 0) {
-        NSLog(@"Leah: geometry entries not found"); return;
-    }
+        int32_t spos = mf_s32(e + 20);
+        if (spos < 0 || (NSUInteger)spos + 300 > len) continue;
+        const uint8_t *sh = b + spos;
 
-    // ── Shape header ───────────────────────────────────────────────────────────
-    int32_t shapPos = mf_s32(b + eBase + shapIdx * 24 + 20);
-    if (shapPos < 0 || (NSUInteger)shapPos + 300 > len) return;
-    const uint8_t *sh = b + shapPos;
-    int32_t pc = mf_s32(sh + 0);   // pointCount
-    int32_t tc = mf_s32(sh + 8);   // triCount
+        uint16_t shading = (uint16_t)(sh[226]<<8 | sh[227]);
+        if (shading >= 16) continue;
 
-    // Shape local matrix: 4 rows × 3 floats at offset 36 (row 3 = translation)
-    float m[4][3];
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 3; c++)
-            m[r][c] = mf_f32(sh + 36 + (r*3 + c)*4);
+        int32_t pc = mf_s32(sh + 0), tc = mf_s32(sh + 8);
+        if (pc <= 0 || tc <= 0) continue;
 
-    // ── Geometry data pointers ─────────────────────────────────────────────────
-    int32_t pntsPos = mf_s32(b + eBase + pntsIdx * 24 + 20);
-    int32_t trigPos = mf_s32(b + eBase + trigIdx * 24 + 20);
-    if (pntsPos < 0 || (NSUInteger)pntsPos + pc*24 > len) return;
-    if (trigPos < 0 || (NSUInteger)trigPos + tc*12 > len) return;
-    const uint8_t *pnts = b + pntsPos;
-    const uint8_t *trig = b + trigPos;
+        // Shape local matrix (WR row-major [4][3])
+        float m[4][3];
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 3; c++)
+                m[r][c] = mf_f32(sh + 36 + (r*3 + c)*4);
 
-    const uint8_t *nrls = NULL;
-    if (nrlsIdx >= 0) {
-        int32_t nrlsPos  = mf_s32(b + eBase + nrlsIdx * 24 + 20);
-        int32_t nrlsSize = mf_s32(b + eBase + nrlsIdx * 24 + 16);
-        if (nrlsPos >= 0 && nrlsSize >= pc*12 && (NSUInteger)nrlsPos + pc*12 <= len)
-            nrls = b + nrlsPos;
-    }
+        // Find depth-bounded child pnts/trig/nrls
+        uint8_t childDepth = e[0] + 1;
+        int32_t pntsPos = -1, trigPos = -1, nrlsPos = -1, nrlsSize = 0;
+        for (uint32_t j = i + 1; j < tagCount; ++j) {
+            const uint8_t *ce = b + eBase + j * 24;
+            if (eBase + j * 24 + 24 > len) break;
+            if (ce[0] < childDepth) break;
+            if (!mf_4cc(ce + 4, "<-->")) continue;
+            int32_t cpos = mf_s32(ce + 20), csz = mf_s32(ce + 16);
+            if (mf_4cc(ce + 8, "pnts") && pntsPos < 0) pntsPos = cpos;
+            if (mf_4cc(ce + 8, "trig") && trigPos < 0) trigPos = cpos;
+            if (mf_4cc(ce + 8, "nrls") && nrlsPos < 0) { nrlsPos = cpos; nrlsSize = csz; }
+        }
+        if (pntsPos < 0 || trigPos < 0) continue;
+        if ((NSUInteger)pntsPos + pc*24 > len || (NSUInteger)trigPos + tc*12 > len) continue;
 
-    // ── Compute per-vertex normals if no stored normals ────────────────────────
-    float *computed = NULL;
-    if (!nrls) {
-        computed = calloc(pc * 3, sizeof(float));
-        for (int ti = 0; ti < tc; ti++) {
-            uint32_t ai = mf_u32(trig + ti*12+0);
-            uint32_t bi = mf_u32(trig + ti*12+4);
-            uint32_t ci = mf_u32(trig + ti*12+8);
-            // Read local positions
-            float ap[3] = { mf_f32(pnts+ai*24), mf_f32(pnts+ai*24+4), mf_f32(pnts+ai*24+8) };
-            float bp[3] = { mf_f32(pnts+bi*24), mf_f32(pnts+bi*24+4), mf_f32(pnts+bi*24+8) };
-            float cp[3] = { mf_f32(pnts+ci*24), mf_f32(pnts+ci*24+4), mf_f32(pnts+ci*24+8) };
-            // Transform to world space
-            float aw[3], bw[3], cw[3];
-            mf_xform_pt(ap, m, aw); mf_xform_pt(bp, m, bw); mf_xform_pt(cp, m, cw);
-            float ux=bw[0]-aw[0], uy=bw[1]-aw[1], uz=bw[2]-aw[2];
-            float vx=cw[0]-aw[0], vy=cw[1]-aw[1], vz=cw[2]-aw[2];
-            float nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
-            uint32_t face[3] = { ai, bi, ci };
-            for (int fi = 0; fi < 3; fi++) {
-                uint32_t idx = face[fi];
-                computed[idx*3]+=nx; computed[idx*3+1]+=ny; computed[idx*3+2]+=nz;
+        const uint8_t *pnts = b + pntsPos;
+        const uint8_t *trig = b + trigPos;
+        const uint8_t *nrls = (nrlsPos >= 0 && nrlsSize >= pc*12 &&
+                               (NSUInteger)nrlsPos + pc*12 <= len) ? b + nrlsPos : NULL;
+
+        // Compute per-vertex normals if not stored
+        float *computed = NULL;
+        if (!nrls) {
+            computed = calloc(pc * 3, sizeof(float));
+            for (int ti = 0; ti < tc; ti++) {
+                uint32_t ai=mf_u32(trig+ti*12+0), bi2=mf_u32(trig+ti*12+4), ci2=mf_u32(trig+ti*12+8);
+                float ap[3]={ mf_f32(pnts+ai*24), mf_f32(pnts+ai*24+4), mf_f32(pnts+ai*24+8) };
+                float bp[3]={ mf_f32(pnts+bi2*24),mf_f32(pnts+bi2*24+4),mf_f32(pnts+bi2*24+8) };
+                float cp[3]={ mf_f32(pnts+ci2*24),mf_f32(pnts+ci2*24+4),mf_f32(pnts+ci2*24+8) };
+                float aw[3], bw[3], cw[3];
+                mf_xform_pt(ap,m,aw); mf_xform_pt(bp,m,bw); mf_xform_pt(cp,m,cw);
+                float ux=bw[0]-aw[0], uy=bw[1]-aw[1], uz=bw[2]-aw[2];
+                float vx=cw[0]-aw[0], vy=cw[1]-aw[1], vz=cw[2]-aw[2];
+                float nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+                uint32_t face[3] = {ai, bi2, ci2};
+                for (int fi = 0; fi < 3; fi++) {
+                    uint32_t idx = face[fi];
+                    if (idx < (uint32_t)pc) {
+                        computed[idx*3]+=nx; computed[idx*3+1]+=ny; computed[idx*3+2]+=nz;
+                    }
+                }
+            }
+            for (int vi = 0; vi < pc; vi++) {
+                float *n = computed + vi*3;
+                float l = sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+                if (l > 1e-6f) { n[0]/=l; n[1]/=l; n[2]/=l; } else { n[0]=0; n[1]=1; n[2]=0; }
             }
         }
+
+        // Build vertex buffer: float3 pos (world), float3 nrm (world), float2 uv
+        float *vbuf = malloc(pc * 32);
         for (int vi = 0; vi < pc; vi++) {
-            float *n = computed + vi*3;
-            float l = sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
-            if (l > 1e-6f) { n[0]/=l; n[1]/=l; n[2]/=l; }
-            else            { n[0]=0;  n[1]=1;  n[2]=0;  }
+            const uint8_t *vp = pnts + vi * 24;
+            float lp[3] = { mf_f32(vp), mf_f32(vp+4), mf_f32(vp+8) };
+            float wp[3]; mf_xform_pt(lp, m, wp);
+            float wn[3];
+            if (nrls) {
+                float ln[3] = { mf_f32(nrls+vi*12), mf_f32(nrls+vi*12+4), mf_f32(nrls+vi*12+8) };
+                mf_xform_nrm(ln, m, wn);
+            } else {
+                wn[0]=computed[vi*3]; wn[1]=computed[vi*3+1]; wn[2]=computed[vi*3+2];
+            }
+            float *dst = vbuf + vi * 8;
+            dst[0]=wp[0]; dst[1]=wp[1]; dst[2]=wp[2];
+            dst[3]=wn[0]; dst[4]=wn[1]; dst[5]=wn[2];
+            dst[6]=mf_f32(vp+12); dst[7]=1.0f-mf_f32(vp+16);
+            bxn=fminf(bxn,wp[0]); bxx=fmaxf(bxx,wp[0]);
+            byn=fminf(byn,wp[1]); byx=fmaxf(byx,wp[1]);
+            bzn=fminf(bzn,wp[2]); bzx=fmaxf(bzx,wp[2]);
         }
-    }
+        free(computed);
+        [model.vertexBufs addObject:[_device newBufferWithBytes:vbuf length:pc*32 options:0]];
+        free(vbuf);
 
-    // ── Build vertex buffer: float3 pos, float3 nrm, float2 uv (32 bytes) ──────
-    float *vbuf = malloc(pc * 32);
-    float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
-    float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
-
-    for (int vi = 0; vi < pc; vi++) {
-        const uint8_t *vp = pnts + vi * 24;
-        float lp[3] = { mf_f32(vp), mf_f32(vp+4), mf_f32(vp+8) };
-        float u = mf_f32(vp+12), v = mf_f32(vp+16);
-
-        float wp[3];
-        mf_xform_pt(lp, m, wp);
-
-        float wn[3];
-        if (nrls) {
-            float ln[3] = { mf_f32(nrls+vi*12), mf_f32(nrls+vi*12+4), mf_f32(nrls+vi*12+8) };
-            mf_xform_nrm(ln, m, wn);
-        } else {
-            wn[0]=computed[vi*3]; wn[1]=computed[vi*3+1]; wn[2]=computed[vi*3+2];
+        // Build index buffer
+        uint32_t *ibuf = malloc(tc * 12);
+        for (int ti = 0; ti < tc; ti++) {
+            ibuf[ti*3+0]=mf_u32(trig+ti*12+0);
+            ibuf[ti*3+1]=mf_u32(trig+ti*12+4);
+            ibuf[ti*3+2]=mf_u32(trig+ti*12+8);
         }
+        [model.indexBufs addObject:[_device newBufferWithBytes:ibuf length:tc*12 options:0]];
+        free(ibuf);
 
-        float *dst = vbuf + vi * 8;
-        dst[0]=wp[0]; dst[1]=wp[1]; dst[2]=wp[2];
-        dst[3]=wn[0]; dst[4]=wn[1]; dst[5]=wn[2];
-        dst[6]=u;     dst[7]=1.0f - v;   // flip V: WR V=0-at-bottom → Metal V=0-at-top
-
-        bxn=fminf(bxn,wp[0]); bxx=fmaxf(bxx,wp[0]);
-        byn=fminf(byn,wp[1]); byx=fmaxf(byx,wp[1]);
-        bzn=fminf(bzn,wp[2]); bzx=fmaxf(bzx,wp[2]);
+        ModelShapeData *sd = &model.shapes[shapIdx];
+        memcpy(sd->tex_id, sh + 200, 4);
+        sd->index_count = (uint32_t)tc * 3;
+        shapIdx++;
     }
-    free(computed);
+    model.shapeCount = shapIdx;
+    model.center   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
+    model.diameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
 
-    _leahCenter   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
-    _leahDiameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
-    _leahVertexBuf = [_device newBufferWithBytes:vbuf length:pc*32 options:0];
-    free(vbuf);
-
-    // ── Index buffer ───────────────────────────────────────────────────────────
-    _leahIndexCount = tc * 3;
-    uint32_t *ibuf = malloc(tc * 12);
-    for (int ti = 0; ti < tc; ti++) {
-        ibuf[ti*3+0] = mf_u32(trig + ti*12+0);
-        ibuf[ti*3+1] = mf_u32(trig + ti*12+4);
-        ibuf[ti*3+2] = mf_u32(trig + ti*12+8);
-    }
-    _leahIndexBuf = [_device newBufferWithBytes:ibuf length:tc*12 options:0];
-    free(ibuf);
-
-    // ── Texture: scan PICT data for embedded JPEG (SOI=FFD8 … EOI=FFD9) ───────
-    if (tximIdx >= 0) {
-        int32_t tximPos  = mf_s32(b + eBase + tximIdx * 24 + 20);
-        int32_t tximSize = mf_s32(b + eBase + tximIdx * 24 + 16);
-        if (tximPos >= 0 && tximSize > 2 && (NSUInteger)tximPos + tximSize <= len) {
-            const uint8_t *pict = b + tximPos;
+    // Extract JPEG textures from cptx/txim entries
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "cptx")) continue;
+        uint8_t cptxDepth = e[0];
+        for (uint32_t j = i + 1; j < tagCount; ++j) {
+            const uint8_t *ne = b + eBase + j * 24;
+            if (eBase + j * 24 + 24 > len) break;
+            if (ne[0] <= cptxDepth && !mf_4cc(ne + 4, "<-->")) break;
+            if (!mf_4cc(ne + 4, "<-->") || !mf_4cc(ne + 8, "txim")) continue;
+            int32_t tpos = mf_s32(ne + 20), tsz = mf_s32(ne + 16);
+            if (tpos < 0 || tsz < 2 || (NSUInteger)tpos + tsz > len) break;
+            const uint8_t *pict = b + tpos;
             NSInteger soi = -1, eoi = -1;
-            for (int32_t j = 0; j < tximSize - 1; j++) {
-                if (pict[j] == 0xFF && pict[j+1] == 0xD8 && soi < 0) soi = j;
-                if (pict[j] == 0xFF && pict[j+1] == 0xD9)            eoi = j + 2;
+            for (int32_t k = 0; k < tsz - 1; k++) {
+                if (pict[k]==0xFF && pict[k+1]==0xD8 && soi < 0) soi = k;
+                if (pict[k]==0xFF && pict[k+1]==0xD9)             eoi = k + 2;
             }
             if (soi >= 0 && eoi > soi) {
                 NSData *jpeg = [NSData dataWithBytes:pict+soi length:eoi-soi];
-                _leahTexture = [self loadJPEGFromData:jpeg];
+                id<MTLTexture> tex = [self loadJPEGFromData:jpeg];
+                if (tex) {
+                    NSData *key = [NSData dataWithBytes:e + 12 length:4];
+                    if (!model.texMap[key]) model.texMap[key] = tex;  // keep first per id
+                }
             }
+            break;
         }
     }
 
-    NSLog(@"Leah: %d verts, %d tris, center=(%.1f,%.1f,%.1f), diam=%.1f%@",
-          pc, tc, _leahCenter.x, _leahCenter.y, _leahCenter.z, _leahDiameter,
-          _leahTexture ? @"" : @" [no texture]");
+    NSLog(@"MetaModel '%@': %lu shapes, center=(%.1f,%.1f,%.1f), diam=%.1f",
+          path.lastPathComponent, (unsigned long)model.shapeCount,
+          model.center.x, model.center.y, model.center.z, model.diameter);
+    return model;
 }
 
-// ── Leah pipeline ─────────────────────────────────────────────────────────────
+// ── Model pipeline (shared by all 3D model scenes) ────────────────────────────
 
-- (void)buildLeahPipeline {
+- (void)buildModelPipeline {
     NSError *err = nil;
-    id<MTLLibrary> lib = [_device newLibraryWithSource:kLeahShaders options:nil error:&err];
-    if (!lib) { NSLog(@"Leah shader error: %@", err); return; }
+    id<MTLLibrary> lib = [_device newLibraryWithSource:kModelShaders options:nil error:&err];
+    if (!lib) { NSLog(@"Model shader error: %@", err); return; }
 
     MTLVertexDescriptor *vd = [MTLVertexDescriptor new];
     vd.attributes[0].format = MTLVertexFormatFloat3; vd.attributes[0].offset =  0; vd.attributes[0].bufferIndex = 0;
@@ -900,13 +918,13 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     vd.layouts[0].stride = 32;
 
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction                  = [lib newFunctionWithName:@"leah_vert"];
-    pd.fragmentFunction                = [lib newFunctionWithName:@"leah_frag"];
+    pd.vertexFunction                  = [lib newFunctionWithName:@"model_vert"];
+    pd.fragmentFunction                = [lib newFunctionWithName:@"model_frag"];
     pd.vertexDescriptor                = vd;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.depthAttachmentPixelFormat      = MTLPixelFormatDepth32Float;
-    _leahPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
-    if (!_leahPipeline) NSLog(@"Leah pipeline error: %@", err);
+    _modelPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!_modelPipeline) NSLog(@"Model pipeline error: %@", err);
 }
 
 // ── Render loop ───────────────────────────────────────────────────────────────
@@ -919,8 +937,8 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 }
 
 - (void)render {
-    if (_scene == 2) { [self renderGBoat]; return; }
-    if (_scene == 1) { [self renderLeah];  return; }
+    if (_scene == 2) { [self renderModel:_gboatModel]; return; }
+    if (_scene == 1) { [self renderModel:_leahModel];  return; }
 
     // ── Compute local animation time (centiseconds) ──
     NSTimeInterval elapsed = -[_startTime timeIntervalSinceNow];
@@ -1006,266 +1024,12 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     [cmd commit];
 }
 
-- (void)renderLeah {
-    if (!_leahPipeline || !_leahVertexBuf) return;
+// ── Generic rotating-model renderer ───────────────────────────────────────────
 
-    _leahAngle += 0.008f;
+- (void)renderModel:(MetaModel *)model {
+    if (!_modelPipeline || !model || model.shapeCount == 0) return;
 
-    id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
-    if (!drawable) return;
-    CGSize sz = _metalLayer.drawableSize;
-
-    if (!_depthTex || _depthTex.width != (NSUInteger)sz.width
-                   || _depthTex.height != (NSUInteger)sz.height) {
-        MTLTextureDescriptor *dd = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-            width:(NSUInteger)sz.width height:(NSUInteger)sz.height mipmapped:NO];
-        dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModePrivate;
-        _depthTex = [_device newTextureWithDescriptor:dd];
-    }
-
-    float aspect  = (float)(sz.width / sz.height);
-    float camDist = _leahDiameter * 1.6f;
-    simd_float3 eye = simd_make_float3(_leahCenter.x, _leahCenter.y,
-                                        _leahCenter.z + camDist);
-    simd_float4x4 proj  = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
-    simd_float4x4 view  = logo_mat_lookAt(eye, _leahCenter, simd_make_float3(0,1,0));
-    simd_float4x4 rotY  = mat_rotY(_leahAngle);
-    simd_float4x4 toO   = mat_translate(-_leahCenter.x, -_leahCenter.y, -_leahCenter.z);
-    simd_float4x4 fromO = mat_translate( _leahCenter.x,  _leahCenter.y,  _leahCenter.z);
-    simd_float4x4 model = simd_mul(simd_mul(fromO, rotY), toO);
-    simd_float4x4 mvp   = simd_mul(simd_mul(proj, view), model);
-    LeahUni uni = { .mvp = mvp, .rotY = rotY };
-
-    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
-    pass.colorAttachments[0].texture     = drawable.texture;
-    pass.colorAttachments[0].loadAction  = MTLLoadActionClear;
-    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0.08, 0.08, 0.12, 1);
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.depthAttachment.texture         = _depthTex;
-    pass.depthAttachment.loadAction      = MTLLoadActionClear;
-    pass.depthAttachment.clearDepth      = 1.0;
-    pass.depthAttachment.storeAction     = MTLStoreActionDontCare;
-
-    id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
-    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-    [enc setRenderPipelineState:_leahPipeline];
-    [enc setDepthStencilState:_depthState];
-    [enc setCullMode:MTLCullModeBack];
-    [enc setFrontFacingWinding:MTLWindingClockwise];
-    [enc setVertexBuffer:_leahVertexBuf  offset:0 atIndex:0];
-    [enc setVertexBytes:&uni  length:sizeof(uni) atIndex:1];
-    [enc setFragmentBytes:&uni length:sizeof(uni) atIndex:1];
-    [enc setFragmentTexture:(_leahTexture ?: _whiteTex) atIndex:0];
-    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                    indexCount:_leahIndexCount
-                     indexType:MTLIndexTypeUInt32
-                   indexBuffer:_leahIndexBuf
-             indexBufferOffset:0];
-    [enc endEncoding];
-    [cmd presentDrawable:drawable];
-    [cmd commit];
-}
-
-// ── G-Boat asset loading ──────────────────────────────────────────────────────
-// Same MetaFile format as Leah; multiple shapes each with their own texture.
-// Vertex positions/normals are transformed into a common model space at load time.
-
-- (void)loadGBoatAssets {
-    NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
-    NSString *path = [[cwd stringByAppendingPathComponent:@"Assets"]
-                           stringByAppendingPathComponent:@"G-Boat"];
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data) { NSLog(@"GBoat: MetaFile not found at %@", path); return; }
-
-    const uint8_t *b   = data.bytes;
-    NSUInteger     len = data.length;
-    if (len < 16) return;
-
-    int32_t  ttPos    = mf_s32(b + 8);
-    uint32_t tagCount = mf_u32(b + ttPos);
-    NSUInteger eBase  = (NSUInteger)ttPos + 4;
-
-    // ── Count renderable shapes ────────────────────────────────────────────
-    uint32_t shapeCount = 0;
-    for (uint32_t i = 0; i < tagCount; ++i) {
-        const uint8_t *e = b + eBase + i * 24;
-        if (eBase + i * 24 + 24 > len) break;
-        if (!mf_4cc(e + 4, "shap")) continue;
-        int32_t spos = mf_s32(e + 20);
-        if (spos >= 0 && (NSUInteger)spos + 228 <= len) {
-            uint16_t shading = (uint16_t)(b[spos+226]<<8 | b[spos+227]);
-            if (shading < 16) shapeCount++;
-        }
-    }
-    _gboatShapes = calloc(shapeCount, sizeof(ModelShapeData));
-
-    // ── Parse shapes ───────────────────────────────────────────────────────
-    uint32_t shapIdx = 0;
-    float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
-    float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
-
-    for (uint32_t i = 0; i < tagCount; ++i) {
-        const uint8_t *e = b + eBase + i * 24;
-        if (eBase + i * 24 + 24 > len) break;
-        if (!mf_4cc(e + 4, "shap")) continue;
-
-        int32_t spos = mf_s32(e + 20);
-        if (spos < 0 || (NSUInteger)spos + 300 > len) continue;
-        const uint8_t *sh = b + spos;
-
-        uint16_t shading = (uint16_t)(sh[226]<<8 | sh[227]);
-        if (shading >= 16) continue;
-
-        int32_t pc = mf_s32(sh + 0), tc = mf_s32(sh + 8);
-        if (pc <= 0 || tc <= 0) continue;
-
-        // Shape local matrix
-        float m[4][3];
-        for (int r = 0; r < 4; r++)
-            for (int c = 0; c < 3; c++)
-                m[r][c] = mf_f32(sh + 36 + (r*3 + c)*4);
-
-        // Find child pnts/trig/nrls (depth-bounded)
-        uint8_t childDepth = e[0] + 1;
-        int32_t pntsPos = -1, trigPos = -1, nrlsPos = -1, nrlsSize = 0;
-        for (uint32_t j = i + 1; j < tagCount; ++j) {
-            const uint8_t *ce = b + eBase + j * 24;
-            if (eBase + j * 24 + 24 > len) break;
-            if (ce[0] < childDepth) break;
-            if (!mf_4cc(ce + 4, "<-->")) continue;
-            int32_t cpos = mf_s32(ce + 20), csz = mf_s32(ce + 16);
-            if (mf_4cc(ce + 8, "pnts") && pntsPos < 0) pntsPos = cpos;
-            if (mf_4cc(ce + 8, "trig") && trigPos < 0) trigPos = cpos;
-            if (mf_4cc(ce + 8, "nrls") && nrlsPos < 0) { nrlsPos = cpos; nrlsSize = csz; }
-        }
-        if (pntsPos < 0 || trigPos < 0) continue;
-        if ((NSUInteger)pntsPos + pc*24 > len || (NSUInteger)trigPos + tc*12 > len) continue;
-
-        const uint8_t *pnts = b + pntsPos;
-        const uint8_t *trig = b + trigPos;
-        const uint8_t *nrls = (nrlsPos >= 0 && nrlsSize >= pc*12 &&
-                               (NSUInteger)nrlsPos + pc*12 <= len) ? b + nrlsPos : NULL;
-
-        // Compute normals if not stored
-        float *computed = NULL;
-        if (!nrls) {
-            computed = calloc(pc * 3, sizeof(float));
-            for (int ti = 0; ti < tc; ti++) {
-                uint32_t ai = mf_u32(trig+ti*12+0), bi2 = mf_u32(trig+ti*12+4), ci2 = mf_u32(trig+ti*12+8);
-                float ap[3]={ mf_f32(pnts+ai*24),mf_f32(pnts+ai*24+4),mf_f32(pnts+ai*24+8) };
-                float bp[3]={ mf_f32(pnts+bi2*24),mf_f32(pnts+bi2*24+4),mf_f32(pnts+bi2*24+8) };
-                float cp2[3]={ mf_f32(pnts+ci2*24),mf_f32(pnts+ci2*24+4),mf_f32(pnts+ci2*24+8) };
-                float aw[3],bw[3],cw[3];
-                mf_xform_pt(ap,m,aw); mf_xform_pt(bp,m,bw); mf_xform_pt(cp2,m,cw);
-                float ux=bw[0]-aw[0],uy=bw[1]-aw[1],uz=bw[2]-aw[2];
-                float vx=cw[0]-aw[0],vy=cw[1]-aw[1],vz=cw[2]-aw[2];
-                float nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
-                uint32_t face[3]={ai,bi2,ci2};
-                for (int fi=0;fi<3;fi++) {
-                    uint32_t idx=face[fi];
-                    if (idx<(uint32_t)pc){computed[idx*3]+=nx;computed[idx*3+1]+=ny;computed[idx*3+2]+=nz;}
-                }
-            }
-            for (int vi=0;vi<pc;vi++){
-                float *n=computed+vi*3; float l=sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
-                if(l>1e-6f){n[0]/=l;n[1]/=l;n[2]/=l;}else{n[0]=0;n[1]=1;n[2]=0;}
-            }
-        }
-
-        // Build vertex buffer (world-space positions/normals)
-        float *vbuf = malloc(pc * 32);
-        for (int vi = 0; vi < pc; vi++) {
-            const uint8_t *vp = pnts + vi * 24;
-            float lp[3] = { mf_f32(vp), mf_f32(vp+4), mf_f32(vp+8) };
-            float wp[3]; mf_xform_pt(lp, m, wp);
-            float wn[3];
-            if (nrls) {
-                float ln[3]={ mf_f32(nrls+vi*12),mf_f32(nrls+vi*12+4),mf_f32(nrls+vi*12+8) };
-                mf_xform_nrm(ln, m, wn);
-            } else {
-                wn[0]=computed[vi*3]; wn[1]=computed[vi*3+1]; wn[2]=computed[vi*3+2];
-            }
-            float *dst = vbuf + vi * 8;
-            dst[0]=wp[0]; dst[1]=wp[1]; dst[2]=wp[2];
-            dst[3]=wn[0]; dst[4]=wn[1]; dst[5]=wn[2];
-            dst[6]=mf_f32(vp+12); dst[7]=1.0f-mf_f32(vp+16);
-            bxn=fminf(bxn,wp[0]); bxx=fmaxf(bxx,wp[0]);
-            byn=fminf(byn,wp[1]); byx=fmaxf(byx,wp[1]);
-            bzn=fminf(bzn,wp[2]); bzx=fmaxf(bzx,wp[2]);
-        }
-        free(computed);
-        [_gboatVertexBufs addObject:[_device newBufferWithBytes:vbuf length:pc*32 options:0]];
-        free(vbuf);
-
-        // Index buffer
-        uint32_t *ibuf = malloc(tc * 12);
-        for (int ti = 0; ti < tc; ti++) {
-            ibuf[ti*3+0]=mf_u32(trig+ti*12+0);
-            ibuf[ti*3+1]=mf_u32(trig+ti*12+4);
-            ibuf[ti*3+2]=mf_u32(trig+ti*12+8);
-        }
-        [_gboatIndexBufs addObject:[_device newBufferWithBytes:ibuf length:tc*12 options:0]];
-        free(ibuf);
-
-        ModelShapeData *sd = &_gboatShapes[shapIdx];
-        memcpy(sd->tex_id, sh + 200, 4);
-        sd->index_count = (uint32_t)tc * 3;
-        char sid[5]={ sh[296+0],sh[296+1],sh[296+2],sh[296+3],0 };
-        NSLog(@"  GBoat shape '%s': %d verts, %d tris", sid, pc, tc);
-        shapIdx++;
-    }
-    _gboatShapeCount = shapIdx;
-
-    _gboatCenter   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
-    _gboatDiameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
-
-    // ── Extract textures ───────────────────────────────────────────────────
-    for (uint32_t i = 0; i < tagCount; ++i) {
-        const uint8_t *e = b + eBase + i * 24;
-        if (eBase + i * 24 + 24 > len) break;
-        if (!mf_4cc(e + 4, "cptx")) continue;
-        uint8_t cptxDepth = e[0];
-        for (uint32_t j = i + 1; j < tagCount; ++j) {
-            const uint8_t *ne = b + eBase + j * 24;
-            if (eBase + j * 24 + 24 > len) break;
-            if (ne[0] <= cptxDepth && !mf_4cc(ne + 4, "<-->")) break;
-            if (!mf_4cc(ne + 4, "<-->") || !mf_4cc(ne + 8, "txim")) continue;
-            int32_t tpos = mf_s32(ne + 20), tsz = mf_s32(ne + 16);
-            if (tpos < 0 || tsz < 2 || (NSUInteger)tpos + tsz > len) break;
-            const uint8_t *pict = b + tpos;
-            NSInteger soi = -1, eoi = -1;
-            for (int32_t k = 0; k < tsz - 1; k++) {
-                if (pict[k]==0xFF && pict[k+1]==0xD8 && soi < 0) soi = k;
-                if (pict[k]==0xFF && pict[k+1]==0xD9)             eoi = k + 2;
-            }
-            if (soi >= 0 && eoi > soi) {
-                NSData *jpeg = [NSData dataWithBytes:pict+soi length:eoi-soi];
-                id<MTLTexture> tex = [self loadJPEGFromData:jpeg];
-                if (tex) {
-                    NSData *key = [NSData dataWithBytes:e + 12 length:4];
-                    if (!_gboatTexMap[key]) {  // keep first occurrence per id
-                        _gboatTexMap[key] = tex;
-                        char tid[5]={e[12],e[13],e[14],e[15],0};
-                        NSLog(@"  GBoat texture '%s' loaded", tid);
-                    }
-                }
-            }
-            break;
-        }
-    }
-
-    NSLog(@"GBoat: %lu shapes, center=(%.1f,%.1f,%.1f), diam=%.1f",
-          (unsigned long)_gboatShapeCount,
-          _gboatCenter.x, _gboatCenter.y, _gboatCenter.z, _gboatDiameter);
-}
-
-// ── G-Boat render ─────────────────────────────────────────────────────────────
-
-- (void)renderGBoat {
-    if (!_leahPipeline || _gboatShapeCount == 0) return;
-
-    _gboatAngle += 0.008f;
+    model.angle += 0.008f;
 
     id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
     if (!drawable) return;
@@ -1281,17 +1045,17 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     }
 
     float aspect  = (float)(sz.width / sz.height);
-    float camDist = _gboatDiameter * 1.6f;
-    simd_float3 eye = simd_make_float3(_gboatCenter.x, _gboatCenter.y,
-                                        _gboatCenter.z + camDist);
+    float camDist = model.diameter * 1.6f;
+    simd_float3 eye = simd_make_float3(model.center.x, model.center.y,
+                                        model.center.z + camDist);
     simd_float4x4 proj  = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
-    simd_float4x4 view  = logo_mat_lookAt(eye, _gboatCenter, simd_make_float3(0,1,0));
-    simd_float4x4 rotY  = mat_rotY(_gboatAngle);
-    simd_float4x4 toO   = mat_translate(-_gboatCenter.x, -_gboatCenter.y, -_gboatCenter.z);
-    simd_float4x4 fromO = mat_translate( _gboatCenter.x,  _gboatCenter.y,  _gboatCenter.z);
-    simd_float4x4 model = simd_mul(simd_mul(fromO, rotY), toO);
-    simd_float4x4 mvp   = simd_mul(simd_mul(proj, view), model);
-    LeahUni uni = { .mvp = mvp, .rotY = rotY };
+    simd_float4x4 view  = logo_mat_lookAt(eye, model.center, simd_make_float3(0,1,0));
+    simd_float4x4 rotY  = mat_rotY(model.angle);
+    simd_float4x4 toO   = mat_translate(-model.center.x, -model.center.y, -model.center.z);
+    simd_float4x4 fromO = mat_translate( model.center.x,  model.center.y,  model.center.z);
+    simd_float4x4 mdl   = simd_mul(simd_mul(fromO, rotY), toO);
+    simd_float4x4 mvp   = simd_mul(simd_mul(proj, view), mdl);
+    ModelUni uni = { .mvp = mvp, .rotY = rotY };
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
     pass.colorAttachments[0].texture     = drawable.texture;
@@ -1305,22 +1069,22 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-    [enc setRenderPipelineState:_leahPipeline];
+    [enc setRenderPipelineState:_modelPipeline];
     [enc setDepthStencilState:_depthState];
     [enc setCullMode:MTLCullModeBack];
     [enc setFrontFacingWinding:MTLWindingClockwise];
     [enc setVertexBytes:&uni  length:sizeof(uni) atIndex:1];
     [enc setFragmentBytes:&uni length:sizeof(uni) atIndex:1];
 
-    for (NSUInteger i = 0; i < _gboatShapeCount; ++i) {
-        NSData *key = [NSData dataWithBytes:_gboatShapes[i].tex_id length:4];
-        id<MTLTexture> tex = _gboatTexMap[key] ?: _whiteTex;
-        [enc setVertexBuffer:_gboatVertexBufs[i] offset:0 atIndex:0];
+    for (NSUInteger i = 0; i < model.shapeCount; ++i) {
+        NSData *key = [NSData dataWithBytes:model.shapes[i].tex_id length:4];
+        id<MTLTexture> tex = model.texMap[key] ?: _whiteTex;
+        [enc setVertexBuffer:model.vertexBufs[i] offset:0 atIndex:0];
         [enc setFragmentTexture:tex atIndex:0];
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
-                        indexCount:_gboatShapes[i].index_count
+                        indexCount:model.shapes[i].index_count
                          indexType:MTLIndexTypeUInt32
-                       indexBuffer:_gboatIndexBufs[i]
+                       indexBuffer:model.indexBufs[i]
                  indexBufferOffset:0];
     }
     [enc endEncoding];
@@ -1340,7 +1104,6 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
         free(_anims[i].events);
     free(_shapes);
     free(_anims);
-    free(_gboatShapes);
 }
 
 @end
