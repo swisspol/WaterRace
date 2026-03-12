@@ -43,6 +43,12 @@ static NSString * const kLogoShaders =
 typedef struct { simd_float4x4 model; simd_float4x4 vp; } LogoUni;
 typedef struct { simd_float4x4 mvp;   simd_float4x4 rotY; } LeahUni;
 
+// ── Per-shape data for multi-shape rotating models (G-Boat, etc.) ─────────────
+typedef struct {
+    uint8_t  tex_id[4];
+    uint32_t index_count;
+} ModelShapeData;
+
 // ── Leah shaders ───────────────────────────────────────────────────────────────
 static NSString * const kLeahShaders =
     @"#include <metal_stdlib>\n"
@@ -299,8 +305,18 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 @property float                       leahDiameter;
 @property float                       leahAngle;
 
-// ── Scene switch ───────────────────────────────────────────────────────────────
-@property BOOL                        showLeah;
+// ── G-Boat scene ───────────────────────────────────────────────────────────────
+@property NSMutableArray<id<MTLBuffer>> *gboatVertexBufs;
+@property NSMutableArray<id<MTLBuffer>> *gboatIndexBufs;
+@property NSMutableDictionary<NSData *, id<MTLTexture>> *gboatTexMap;
+@property NSUInteger                  gboatShapeCount;
+@property ModelShapeData             *gboatShapes;   // malloc'd
+@property simd_float3                 gboatCenter;
+@property float                       gboatDiameter;
+@property float                       gboatAngle;
+
+// ── Scene state (0=logo, 1=leah, 2=gboat) ─────────────────────────────────────
+@property NSInteger                   scene;
 @end
 
 @implementation LogoIntroView
@@ -316,14 +332,18 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     _metalLayer.pixelFormat  = MTLPixelFormatBGRA8Unorm;
     _metalLayer.drawableSize = CGSizeMake(frame.size.width * 2, frame.size.height * 2);
 
-    _commandQueue = [_device newCommandQueue];
-    _vertexBufs   = [NSMutableArray new];
-    _indexBufs    = [NSMutableArray new];
-    _texMap       = [NSMutableDictionary new];
+    _commandQueue    = [_device newCommandQueue];
+    _vertexBufs      = [NSMutableArray new];
+    _indexBufs       = [NSMutableArray new];
+    _texMap          = [NSMutableDictionary new];
+    _gboatVertexBufs = [NSMutableArray new];
+    _gboatIndexBufs  = [NSMutableArray new];
+    _gboatTexMap     = [NSMutableDictionary new];
 
     if (![self loadAssets] || ![self buildPipeline]) return nil;
-    [self loadLeahAssets];   // best-effort; missing files = no Leah scene
-    [self buildLeahPipeline];
+    [self loadLeahAssets];    // best-effort
+    [self loadGBoatAssets];   // best-effort
+    [self buildLeahPipeline]; // shared pipeline for Leah + G-Boat
 
     _startTime = [NSDate date];
     CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
@@ -335,7 +355,7 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 - (BOOL)acceptsFirstResponder { return YES; }
 
 - (void)keyDown:(NSEvent *)event {
-    _showLeah = YES;
+    if (_scene < 2) _scene++;
 }
 
 - (CALayer *)makeBackingLayer { return [CAMetalLayer layer]; }
@@ -899,7 +919,8 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 }
 
 - (void)render {
-    if (_showLeah) { [self renderLeah]; return; }
+    if (_scene == 2) { [self renderGBoat]; return; }
+    if (_scene == 1) { [self renderLeah];  return; }
 
     // ── Compute local animation time (centiseconds) ──
     NSTimeInterval elapsed = -[_startTime timeIntervalSinceNow];
@@ -1046,6 +1067,267 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     [cmd commit];
 }
 
+// ── G-Boat asset loading ──────────────────────────────────────────────────────
+// Same MetaFile format as Leah; multiple shapes each with their own texture.
+// Vertex positions/normals are transformed into a common model space at load time.
+
+- (void)loadGBoatAssets {
+    NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
+    NSString *path = [[cwd stringByAppendingPathComponent:@"GBoatAssets"]
+                           stringByAppendingPathComponent:@"G-Boat"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) { NSLog(@"GBoat: MetaFile not found at %@", path); return; }
+
+    const uint8_t *b   = data.bytes;
+    NSUInteger     len = data.length;
+    if (len < 16) return;
+
+    int32_t  ttPos    = mf_s32(b + 8);
+    uint32_t tagCount = mf_u32(b + ttPos);
+    NSUInteger eBase  = (NSUInteger)ttPos + 4;
+
+    // ── Count renderable shapes ────────────────────────────────────────────
+    uint32_t shapeCount = 0;
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "shap")) continue;
+        int32_t spos = mf_s32(e + 20);
+        if (spos >= 0 && (NSUInteger)spos + 228 <= len) {
+            uint16_t shading = (uint16_t)(b[spos+226]<<8 | b[spos+227]);
+            if (shading < 16) shapeCount++;
+        }
+    }
+    _gboatShapes = calloc(shapeCount, sizeof(ModelShapeData));
+
+    // ── Parse shapes ───────────────────────────────────────────────────────
+    uint32_t shapIdx = 0;
+    float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
+    float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
+
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "shap")) continue;
+
+        int32_t spos = mf_s32(e + 20);
+        if (spos < 0 || (NSUInteger)spos + 300 > len) continue;
+        const uint8_t *sh = b + spos;
+
+        uint16_t shading = (uint16_t)(sh[226]<<8 | sh[227]);
+        if (shading >= 16) continue;
+
+        int32_t pc = mf_s32(sh + 0), tc = mf_s32(sh + 8);
+        if (pc <= 0 || tc <= 0) continue;
+
+        // Shape local matrix
+        float m[4][3];
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 3; c++)
+                m[r][c] = mf_f32(sh + 36 + (r*3 + c)*4);
+
+        // Find child pnts/trig/nrls (depth-bounded)
+        uint8_t childDepth = e[0] + 1;
+        int32_t pntsPos = -1, trigPos = -1, nrlsPos = -1, nrlsSize = 0;
+        for (uint32_t j = i + 1; j < tagCount; ++j) {
+            const uint8_t *ce = b + eBase + j * 24;
+            if (eBase + j * 24 + 24 > len) break;
+            if (ce[0] < childDepth) break;
+            if (!mf_4cc(ce + 4, "<-->")) continue;
+            int32_t cpos = mf_s32(ce + 20), csz = mf_s32(ce + 16);
+            if (mf_4cc(ce + 8, "pnts") && pntsPos < 0) pntsPos = cpos;
+            if (mf_4cc(ce + 8, "trig") && trigPos < 0) trigPos = cpos;
+            if (mf_4cc(ce + 8, "nrls") && nrlsPos < 0) { nrlsPos = cpos; nrlsSize = csz; }
+        }
+        if (pntsPos < 0 || trigPos < 0) continue;
+        if ((NSUInteger)pntsPos + pc*24 > len || (NSUInteger)trigPos + tc*12 > len) continue;
+
+        const uint8_t *pnts = b + pntsPos;
+        const uint8_t *trig = b + trigPos;
+        const uint8_t *nrls = (nrlsPos >= 0 && nrlsSize >= pc*12 &&
+                               (NSUInteger)nrlsPos + pc*12 <= len) ? b + nrlsPos : NULL;
+
+        // Compute normals if not stored
+        float *computed = NULL;
+        if (!nrls) {
+            computed = calloc(pc * 3, sizeof(float));
+            for (int ti = 0; ti < tc; ti++) {
+                uint32_t ai = mf_u32(trig+ti*12+0), bi2 = mf_u32(trig+ti*12+4), ci2 = mf_u32(trig+ti*12+8);
+                float ap[3]={ mf_f32(pnts+ai*24),mf_f32(pnts+ai*24+4),mf_f32(pnts+ai*24+8) };
+                float bp[3]={ mf_f32(pnts+bi2*24),mf_f32(pnts+bi2*24+4),mf_f32(pnts+bi2*24+8) };
+                float cp2[3]={ mf_f32(pnts+ci2*24),mf_f32(pnts+ci2*24+4),mf_f32(pnts+ci2*24+8) };
+                float aw[3],bw[3],cw[3];
+                mf_xform_pt(ap,m,aw); mf_xform_pt(bp,m,bw); mf_xform_pt(cp2,m,cw);
+                float ux=bw[0]-aw[0],uy=bw[1]-aw[1],uz=bw[2]-aw[2];
+                float vx=cw[0]-aw[0],vy=cw[1]-aw[1],vz=cw[2]-aw[2];
+                float nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;
+                uint32_t face[3]={ai,bi2,ci2};
+                for (int fi=0;fi<3;fi++) {
+                    uint32_t idx=face[fi];
+                    if (idx<(uint32_t)pc){computed[idx*3]+=nx;computed[idx*3+1]+=ny;computed[idx*3+2]+=nz;}
+                }
+            }
+            for (int vi=0;vi<pc;vi++){
+                float *n=computed+vi*3; float l=sqrtf(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+                if(l>1e-6f){n[0]/=l;n[1]/=l;n[2]/=l;}else{n[0]=0;n[1]=1;n[2]=0;}
+            }
+        }
+
+        // Build vertex buffer (world-space positions/normals)
+        float *vbuf = malloc(pc * 32);
+        for (int vi = 0; vi < pc; vi++) {
+            const uint8_t *vp = pnts + vi * 24;
+            float lp[3] = { mf_f32(vp), mf_f32(vp+4), mf_f32(vp+8) };
+            float wp[3]; mf_xform_pt(lp, m, wp);
+            float wn[3];
+            if (nrls) {
+                float ln[3]={ mf_f32(nrls+vi*12),mf_f32(nrls+vi*12+4),mf_f32(nrls+vi*12+8) };
+                mf_xform_nrm(ln, m, wn);
+            } else {
+                wn[0]=computed[vi*3]; wn[1]=computed[vi*3+1]; wn[2]=computed[vi*3+2];
+            }
+            float *dst = vbuf + vi * 8;
+            dst[0]=wp[0]; dst[1]=wp[1]; dst[2]=wp[2];
+            dst[3]=wn[0]; dst[4]=wn[1]; dst[5]=wn[2];
+            dst[6]=mf_f32(vp+12); dst[7]=1.0f-mf_f32(vp+16);
+            bxn=fminf(bxn,wp[0]); bxx=fmaxf(bxx,wp[0]);
+            byn=fminf(byn,wp[1]); byx=fmaxf(byx,wp[1]);
+            bzn=fminf(bzn,wp[2]); bzx=fmaxf(bzx,wp[2]);
+        }
+        free(computed);
+        [_gboatVertexBufs addObject:[_device newBufferWithBytes:vbuf length:pc*32 options:0]];
+        free(vbuf);
+
+        // Index buffer
+        uint32_t *ibuf = malloc(tc * 12);
+        for (int ti = 0; ti < tc; ti++) {
+            ibuf[ti*3+0]=mf_u32(trig+ti*12+0);
+            ibuf[ti*3+1]=mf_u32(trig+ti*12+4);
+            ibuf[ti*3+2]=mf_u32(trig+ti*12+8);
+        }
+        [_gboatIndexBufs addObject:[_device newBufferWithBytes:ibuf length:tc*12 options:0]];
+        free(ibuf);
+
+        ModelShapeData *sd = &_gboatShapes[shapIdx];
+        memcpy(sd->tex_id, sh + 200, 4);
+        sd->index_count = (uint32_t)tc * 3;
+        char sid[5]={ sh[296+0],sh[296+1],sh[296+2],sh[296+3],0 };
+        NSLog(@"  GBoat shape '%s': %d verts, %d tris", sid, pc, tc);
+        shapIdx++;
+    }
+    _gboatShapeCount = shapIdx;
+
+    _gboatCenter   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
+    _gboatDiameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
+
+    // ── Extract textures ───────────────────────────────────────────────────
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i * 24;
+        if (eBase + i * 24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "cptx")) continue;
+        uint8_t cptxDepth = e[0];
+        for (uint32_t j = i + 1; j < tagCount; ++j) {
+            const uint8_t *ne = b + eBase + j * 24;
+            if (eBase + j * 24 + 24 > len) break;
+            if (ne[0] <= cptxDepth && !mf_4cc(ne + 4, "<-->")) break;
+            if (!mf_4cc(ne + 4, "<-->") || !mf_4cc(ne + 8, "txim")) continue;
+            int32_t tpos = mf_s32(ne + 20), tsz = mf_s32(ne + 16);
+            if (tpos < 0 || tsz < 2 || (NSUInteger)tpos + tsz > len) break;
+            const uint8_t *pict = b + tpos;
+            NSInteger soi = -1, eoi = -1;
+            for (int32_t k = 0; k < tsz - 1; k++) {
+                if (pict[k]==0xFF && pict[k+1]==0xD8 && soi < 0) soi = k;
+                if (pict[k]==0xFF && pict[k+1]==0xD9)             eoi = k + 2;
+            }
+            if (soi >= 0 && eoi > soi) {
+                NSData *jpeg = [NSData dataWithBytes:pict+soi length:eoi-soi];
+                id<MTLTexture> tex = [self loadJPEGFromData:jpeg];
+                if (tex) {
+                    NSData *key = [NSData dataWithBytes:e + 12 length:4];
+                    if (!_gboatTexMap[key]) {  // keep first occurrence per id
+                        _gboatTexMap[key] = tex;
+                        char tid[5]={e[12],e[13],e[14],e[15],0};
+                        NSLog(@"  GBoat texture '%s' loaded", tid);
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    NSLog(@"GBoat: %lu shapes, center=(%.1f,%.1f,%.1f), diam=%.1f",
+          (unsigned long)_gboatShapeCount,
+          _gboatCenter.x, _gboatCenter.y, _gboatCenter.z, _gboatDiameter);
+}
+
+// ── G-Boat render ─────────────────────────────────────────────────────────────
+
+- (void)renderGBoat {
+    if (!_leahPipeline || _gboatShapeCount == 0) return;
+
+    _gboatAngle += 0.008f;
+
+    id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
+    if (!drawable) return;
+    CGSize sz = _metalLayer.drawableSize;
+
+    if (!_depthTex || _depthTex.width != (NSUInteger)sz.width
+                   || _depthTex.height != (NSUInteger)sz.height) {
+        MTLTextureDescriptor *dd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+            width:(NSUInteger)sz.width height:(NSUInteger)sz.height mipmapped:NO];
+        dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModePrivate;
+        _depthTex = [_device newTextureWithDescriptor:dd];
+    }
+
+    float aspect  = (float)(sz.width / sz.height);
+    float camDist = _gboatDiameter * 1.6f;
+    simd_float3 eye = simd_make_float3(_gboatCenter.x, _gboatCenter.y,
+                                        _gboatCenter.z + camDist);
+    simd_float4x4 proj  = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
+    simd_float4x4 view  = logo_mat_lookAt(eye, _gboatCenter, simd_make_float3(0,1,0));
+    simd_float4x4 rotY  = mat_rotY(_gboatAngle);
+    simd_float4x4 toO   = mat_translate(-_gboatCenter.x, -_gboatCenter.y, -_gboatCenter.z);
+    simd_float4x4 fromO = mat_translate( _gboatCenter.x,  _gboatCenter.y,  _gboatCenter.z);
+    simd_float4x4 model = simd_mul(simd_mul(fromO, rotY), toO);
+    simd_float4x4 mvp   = simd_mul(simd_mul(proj, view), model);
+    LeahUni uni = { .mvp = mvp, .rotY = rotY };
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
+    pass.colorAttachments[0].texture     = drawable.texture;
+    pass.colorAttachments[0].loadAction  = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0.08, 0.08, 0.12, 1);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.depthAttachment.texture         = _depthTex;
+    pass.depthAttachment.loadAction      = MTLLoadActionClear;
+    pass.depthAttachment.clearDepth      = 1.0;
+    pass.depthAttachment.storeAction     = MTLStoreActionDontCare;
+
+    id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+    [enc setRenderPipelineState:_leahPipeline];
+    [enc setDepthStencilState:_depthState];
+    [enc setCullMode:MTLCullModeBack];
+    [enc setFrontFacingWinding:MTLWindingClockwise];
+    [enc setVertexBytes:&uni  length:sizeof(uni) atIndex:1];
+    [enc setFragmentBytes:&uni length:sizeof(uni) atIndex:1];
+
+    for (NSUInteger i = 0; i < _gboatShapeCount; ++i) {
+        NSData *key = [NSData dataWithBytes:_gboatShapes[i].tex_id length:4];
+        id<MTLTexture> tex = _gboatTexMap[key] ?: _whiteTex;
+        [enc setVertexBuffer:_gboatVertexBufs[i] offset:0 atIndex:0];
+        [enc setFragmentTexture:tex atIndex:0];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                        indexCount:_gboatShapes[i].index_count
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:_gboatIndexBufs[i]
+                 indexBufferOffset:0];
+    }
+    [enc endEncoding];
+    [cmd presentDrawable:drawable];
+    [cmd commit];
+}
+
 - (void)setFrameSize:(NSSize)sz {
     [super setFrameSize:sz];
     _metalLayer.drawableSize = CGSizeMake(sz.width * 2, sz.height * 2);
@@ -1058,6 +1340,7 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
         free(_anims[i].events);
     free(_shapes);
     free(_anims);
+    free(_gboatShapes);
 }
 
 @end
