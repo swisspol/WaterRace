@@ -322,10 +322,10 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 @property id<MTLRenderPipelineState>  modelPipeline;
 
 // ── Rotating model scenes ──────────────────────────────────────────────────────
-@property MetaModel                  *leahModel;
-@property MetaModel                  *gboatModel;
+@property NSArray<MetaModel *>       *models;
+@property NSInteger                   modelIndex;
 
-// ── Scene state (0=logo, 1=leah, 2=gboat) ─────────────────────────────────────
+// ── Scene state (0=logo, 1+=3D model) ─────────────────────────────────────────
 @property NSInteger                   scene;
 @end
 
@@ -349,10 +349,20 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 
     if (![self loadAssets] || ![self buildPipeline]) return nil;
     [self buildModelPipeline];
-    NSString *assets = [NSFileManager.defaultManager.currentDirectoryPath
-                        stringByAppendingPathComponent:@"Assets"];
-    _leahModel  = [self loadModelFromPath:[assets stringByAppendingPathComponent:@"Leah"]];
-    _gboatModel = [self loadModelFromPath:[assets stringByAppendingPathComponent:@"G-Boat"]];
+    NSString *assetsDir = [NSFileManager.defaultManager.currentDirectoryPath
+                           stringByAppendingPathComponent:@"Assets"];
+    NSArray<NSString *> *entries = [[NSFileManager.defaultManager
+        contentsOfDirectoryAtPath:assetsDir error:nil]
+        sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    NSMutableArray<MetaModel *> *loadedModels = [NSMutableArray new];
+    for (NSString *name in entries) {
+        if ([name isEqualToString:@"Logo Intro"]) continue;
+        NSString *path = [assetsDir stringByAppendingPathComponent:name];
+        MetaModel *m = [self loadModelFromPath:path];
+        if (m) [loadedModels addObject:m];
+    }
+    _models     = [loadedModels copy];
+    _modelIndex = 0;
 
     _startTime = [NSDate date];
     CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
@@ -364,12 +374,159 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 - (BOOL)acceptsFirstResponder { return YES; }
 
 - (void)keyDown:(NSEvent *)event {
-    if (_scene < 2) _scene++;
+    if (_scene == 0) {
+        _scene = 1;
+    } else if (_models.count > 0) {
+        _modelIndex = (_modelIndex + 1) % (NSInteger)_models.count;
+    }
 }
 
 - (CALayer *)makeBackingLayer { return [CAMetalLayer layer]; }
 
 // ── Asset loading ──────────────────────────────────────────────────────────────
+
+// PackBits decompression — byte mode (packType=4, 32-bit pixels)
+static void packbits_bytes(const uint8_t *src, uint32_t srcLen,
+                            uint8_t *dst, uint32_t dstLen) {
+    uint32_t si = 0, di = 0;
+    while (si < srcLen && di < dstLen) {
+        int n = (int)(int8_t)src[si++];
+        if (n == -128) continue;
+        if (n >= 0) {
+            uint32_t cnt = (uint32_t)(n + 1);
+            uint32_t avail = MIN(cnt, MIN(srcLen - si, dstLen - di));
+            memcpy(dst + di, src + si, avail); si += cnt; di += avail;
+        } else {
+            uint32_t cnt = (uint32_t)(1 - n);
+            if (si >= srcLen) break;
+            uint8_t byte = src[si++];
+            uint32_t avail = MIN(cnt, dstLen - di);
+            memset(dst + di, byte, avail); di += avail;
+        }
+    }
+}
+
+// PackBits decompression — word mode (packType=3, 16-bit pixels)
+static void packbits_words(const uint8_t *src, uint32_t srcLen,
+                            uint8_t *dst, uint32_t dstLen) {
+    uint32_t si = 0, di = 0;
+    while (si < srcLen && di + 1 < dstLen) {
+        int n = (int)(int8_t)src[si++];
+        if (n == -128) continue;
+        if (n >= 0) {
+            uint32_t bytes = (uint32_t)(n + 1) * 2;
+            uint32_t avail = MIN(bytes, MIN(srcLen - si, dstLen - di)) & ~1u;
+            memcpy(dst + di, src + si, avail); si += bytes; di += avail;
+        } else {
+            uint32_t bytes = (uint32_t)(1 - n) * 2;
+            if (si + 1 >= srcLen) break;
+            uint8_t hi = src[si++], lo = src[si++];
+            uint32_t avail = MIN(bytes, dstLen - di) & ~1u;
+            for (uint32_t k = 0; k < avail; k += 2) { dst[di+k]=hi; dst[di+k+1]=lo; }
+            di += avail;
+        }
+    }
+}
+
+// Load a texture from a PICT v2 blob (handles CompressedQuickTime JPEG
+// and DirectBitsRect with packType=4/32-bit or packType=3/16-bit pixels).
+- (nullable id<MTLTexture>)loadTextureFromPICT:(const uint8_t *)p length:(NSUInteger)len {
+    if (len < 12) return nil;
+    NSUInteger pos = 10; // skip picSize(2) + picFrame(8)
+    while (pos + 2 <= len) {
+        uint16_t op = (uint16_t)(p[pos]<<8|p[pos+1]); pos += 2;
+        if      (op == 0x0011) { pos += 2; }                // VersionOp
+        else if (op == 0x0C00) { pos += 24; }               // HeaderOp
+        else if (op == 0x001E) { /* DefHilite — no data */ }
+        else if (op == 0x0001) {                             // Clip
+            if (pos + 2 > len) break;
+            pos += (uint16_t)(p[pos]<<8|p[pos+1]);
+        }
+        else if (op == 0x00A1) {                             // LongComment
+            pos += 2; // kind
+            if (pos + 2 > len) break;
+            uint16_t sz = (uint16_t)(p[pos]<<8|p[pos+1]); pos += 2 + sz;
+        }
+        else if (op == 0x8200) {                             // CompressedQuickTime → JPEG
+            if (pos + 4 > len) break;
+            uint32_t qtLen = mf_u32(p + pos); pos += 4;
+            NSInteger soi = -1, eoi = -1;
+            for (uint32_t k = 0; k + 1 < qtLen && pos + k + 1 < len; k++) {
+                if (p[pos+k]==0xFF && p[pos+k+1]==0xD8 && soi<0) soi = (NSInteger)k;
+                if (p[pos+k]==0xFF && p[pos+k+1]==0xD9) eoi = (NSInteger)(k+2);
+            }
+            if (soi >= 0 && eoi > soi) {
+                NSData *jpeg = [NSData dataWithBytes:p+pos+soi length:(NSUInteger)(eoi-soi)];
+                return [self loadJPEGFromData:jpeg];
+            }
+            return nil;
+        }
+        else if (op == 0x009A) {                             // DirectBitsRect
+            if (pos + 4 + 46 + 18 > len) break;
+            pos += 4; // skip baseAddr (fake handle 0x000000FF)
+            // PixMap fields (at pos, without baseAddr; 46 bytes total):
+            uint16_t rowBytes  = (uint16_t)((p[pos]   <<8|p[pos+1]) & 0x7FFF);
+            int32_t  top       = (int32_t)(int16_t)(p[pos+2] <<8|p[pos+3]);
+            int32_t  left      = (int32_t)(int16_t)(p[pos+4] <<8|p[pos+5]);
+            int32_t  bot       = (int32_t)(int16_t)(p[pos+6] <<8|p[pos+7]);
+            int32_t  rgt       = (int32_t)(int16_t)(p[pos+8] <<8|p[pos+9]);
+            uint16_t packType  = (uint16_t)(p[pos+12]<<8|p[pos+13]);
+            uint16_t pixelSize = (uint16_t)(p[pos+28]<<8|p[pos+29]);
+            uint16_t cmpCount  = (uint16_t)(p[pos+30]<<8|p[pos+31]);
+            pos += 46; // past PixMap (without baseAddr)
+            pos += 18; // srcRect(8)+dstRect(8)+mode(2)
+            int32_t W = rgt-left, H = bot-top;
+            if (W<=0 || H<=0 || pos>len) break;
+            BOOL longPfx = rowBytes > 250;
+            uint8_t *rgba = malloc((size_t)W*(size_t)H*4);
+
+            if (packType==4 && pixelSize==32 && (cmpCount==3||cmpCount==4)) {
+                uint32_t rowU = (uint32_t)(W*cmpCount);
+                uint8_t *row = malloc(rowU);
+                for (int32_t y=0; y<H && pos<len; y++) {
+                    uint32_t rSz = longPfx ? (uint32_t)(p[pos]<<8|p[pos+1]) : p[pos];
+                    pos += longPfx ? 2 : 1;
+                    if (pos+rSz > len) { free(row); free(rgba); return nil; }
+                    packbits_bytes(p+pos, rSz, row, rowU); pos += rSz;
+                    uint8_t *R=(cmpCount==3)?row      :row+W;
+                    uint8_t *G=(cmpCount==3)?row+W    :row+W*2;
+                    uint8_t *B=(cmpCount==3)?row+W*2  :row+W*3;
+                    uint8_t *d=rgba+y*W*4;
+                    for (int32_t x=0;x<W;x++){d[x*4]=R[x];d[x*4+1]=G[x];d[x*4+2]=B[x];d[x*4+3]=255;}
+                }
+                free(row);
+            } else if (packType==3 && pixelSize==16 && cmpCount==3) {
+                uint8_t *row = malloc((size_t)W*2);
+                for (int32_t y=0; y<H && pos<len; y++) {
+                    uint32_t rSz = longPfx ? (uint32_t)(p[pos]<<8|p[pos+1]) : p[pos];
+                    pos += longPfx ? 2 : 1;
+                    if (pos+rSz > len) { free(row); free(rgba); return nil; }
+                    packbits_words(p+pos, rSz, row, (uint32_t)(W*2)); pos += rSz;
+                    uint8_t *d=rgba+y*W*4;
+                    for (int32_t x=0;x<W;x++){
+                        uint16_t v=(uint16_t)(row[x*2]<<8|row[x*2+1]);
+                        d[x*4]=(uint8_t)(((v>>10)&0x1F)*255/31);
+                        d[x*4+1]=(uint8_t)(((v>>5)&0x1F)*255/31);
+                        d[x*4+2]=(uint8_t)((v&0x1F)*255/31);
+                        d[x*4+3]=255;
+                    }
+                }
+                free(row);
+            } else { free(rgba); return nil; }
+
+            MTLTextureDescriptor *td=[MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                width:(NSUInteger)W height:(NSUInteger)H mipmapped:NO];
+            id<MTLTexture> tex=[_device newTextureWithDescriptor:td];
+            [tex replaceRegion:MTLRegionMake2D(0,0,W,H) mipmapLevel:0
+                     withBytes:rgba bytesPerRow:(NSUInteger)(W*4)];
+            free(rgba);
+            return tex;
+        }
+        else { break; } // unknown opcode
+    }
+    return nil;
+}
 
 - (id<MTLTexture>)loadJPEGFromData:(NSData *)jpegData {
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpegData, nil);
@@ -622,23 +779,13 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
             if (ne[0] <= cptxDepth && !mf_4cc(ne + 4, "<-->")) break;
             if (!mf_4cc(ne + 4, "<-->") || !mf_4cc(ne + 8, "txim")) continue;
             int32_t tpos = mf_s32(ne + 20), tsz = mf_s32(ne + 16);
-            if (tpos < 0 || tsz < 2 || (NSUInteger)tpos + tsz > len) break;
-            // Scan PICT for embedded JPEG (SOI=FFD8 … EOI=FFD9)
-            const uint8_t *pict = b + tpos;
-            NSInteger soi = -1, eoi = -1;
-            for (int32_t k = 0; k < tsz - 1; k++) {
-                if (pict[k]==0xFF && pict[k+1]==0xD8 && soi < 0) soi = k;
-                if (pict[k]==0xFF && pict[k+1]==0xD9)             eoi = k + 2;
-            }
-            if (soi >= 0 && eoi > soi) {
-                NSData *jpeg = [NSData dataWithBytes:pict+soi length:eoi-soi];
-                id<MTLTexture> tex = [self loadJPEGFromData:jpeg];
-                if (tex) {
-                    NSData *key = [NSData dataWithBytes:e + 12 length:4];
-                    _texMap[key] = tex;
-                    char tid[5] = { e[12], e[13], e[14], e[15], 0 };
-                    NSLog(@"  Texture '%s' loaded", tid);
-                }
+            if (tpos < 0 || tsz < 12 || (NSUInteger)tpos + tsz > len) break;
+            id<MTLTexture> tex = [self loadTextureFromPICT:b+tpos length:(NSUInteger)tsz];
+            if (tex) {
+                NSData *key = [NSData dataWithBytes:e + 12 length:4];
+                _texMap[key] = tex;
+                char tid[5] = { e[12], e[13], e[14], e[15], 0 };
+                NSLog(@"  Texture '%s' loaded", tid);
             }
             break;
         }
@@ -867,7 +1014,7 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     model.center   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
     model.diameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
 
-    // Extract JPEG textures from cptx/txim entries
+    // Extract textures from cptx/txim PICT entries
     for (uint32_t i = 0; i < tagCount; ++i) {
         const uint8_t *e = b + eBase + i * 24;
         if (eBase + i * 24 + 24 > len) break;
@@ -879,27 +1026,18 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
             if (ne[0] <= cptxDepth && !mf_4cc(ne + 4, "<-->")) break;
             if (!mf_4cc(ne + 4, "<-->") || !mf_4cc(ne + 8, "txim")) continue;
             int32_t tpos = mf_s32(ne + 20), tsz = mf_s32(ne + 16);
-            if (tpos < 0 || tsz < 2 || (NSUInteger)tpos + tsz > len) break;
-            const uint8_t *pict = b + tpos;
-            NSInteger soi = -1, eoi = -1;
-            for (int32_t k = 0; k < tsz - 1; k++) {
-                if (pict[k]==0xFF && pict[k+1]==0xD8 && soi < 0) soi = k;
-                if (pict[k]==0xFF && pict[k+1]==0xD9)             eoi = k + 2;
-            }
-            if (soi >= 0 && eoi > soi) {
-                NSData *jpeg = [NSData dataWithBytes:pict+soi length:eoi-soi];
-                id<MTLTexture> tex = [self loadJPEGFromData:jpeg];
-                if (tex) {
-                    NSData *key = [NSData dataWithBytes:e + 12 length:4];
-                    if (!model.texMap[key]) model.texMap[key] = tex;  // keep first per id
-                }
+            if (tpos < 0 || tsz < 12 || (NSUInteger)tpos + tsz > len) break;
+            id<MTLTexture> tex = [self loadTextureFromPICT:b+tpos length:(NSUInteger)tsz];
+            if (tex) {
+                NSData *key = [NSData dataWithBytes:e + 12 length:4];
+                if (!model.texMap[key]) model.texMap[key] = tex;
             }
             break;
         }
     }
-
-    NSLog(@"MetaModel '%@': %lu shapes, center=(%.1f,%.1f,%.1f), diam=%.1f",
+    NSLog(@"MetaModel '%@': %lu shapes, %lu textures, center=(%.1f,%.1f,%.1f), diam=%.1f",
           path.lastPathComponent, (unsigned long)model.shapeCount,
+          (unsigned long)model.texMap.count,
           model.center.x, model.center.y, model.center.z, model.diameter);
     return model;
 }
@@ -937,8 +1075,7 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 }
 
 - (void)render {
-    if (_scene == 2) { [self renderModel:_gboatModel]; return; }
-    if (_scene == 1) { [self renderModel:_leahModel];  return; }
+    if (_scene == 1 && _models.count > 0) { [self renderModel:_models[_modelIndex]]; return; }
 
     // ── Compute local animation time (centiseconds) ──
     NSTimeInterval elapsed = -[_startTime timeIntervalSinceNow];
