@@ -166,7 +166,7 @@ static NSString * const kModelShaders =
     "fragment float4 model_frag(MVout in [[stage_in]],\n"
     "                           texture2d<float> tex [[texture(0)]],\n"
     "                           constant MUni &u [[buffer(1)]]) {\n"
-    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    constexpr sampler s(filter::linear, address::repeat);\n"
     "    float4 c = tex.sample(s, in.uv);\n"
     "    float3 L = normalize(float3(0.6, 1.0, 0.8));\n"
     "    float  d = max(0.0f, dot(normalize(in.nrm), L));\n"
@@ -479,6 +479,14 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
 @property NSArray<MetaModel *>       *models;
 @property NSInteger                   modelIndex;
 
+// ── First-person camera (terrain exploration) ──────────────────────────────────
+@property simd_float3  fpPos;        // world-space eye position
+@property float        fpYaw;        // look left/right (radians, around Y)
+@property float        fpPitch;      // look up/down (radians, around X, clamped ±89°)
+@property uint32_t     keysHeld;     // bitmask: 1=fwd 2=back 4=left 8=right
+@property BOOL         mouseCaptured;
+@property NSInteger    fpModelIdx;   // model index when camera was last initialized
+
 // ── Scene state (0=logo, 1+=3D model) ─────────────────────────────────────────
 @property NSInteger                   scene;
 @end
@@ -500,6 +508,7 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
     _vertexBufs   = [NSMutableArray new];
     _indexBufs    = [NSMutableArray new];
     _texMap       = [NSMutableDictionary new];
+    _fpModelIdx   = -1;  // force camera init on first terrain render
 
     if (![self loadAssets] || ![self buildPipeline]) return nil;
     [self buildModelPipeline];
@@ -550,12 +559,65 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
 
 - (BOOL)acceptsFirstResponder { return YES; }
 
+- (void)viewDidMoveToWindow {
+    [super viewDidMoveToWindow];
+    self.window.acceptsMouseMovedEvents = YES;
+}
+
+// Map key code to movement bitmask (1=fwd, 2=back, 4=left, 8=right); 0=not a move key.
+static uint32_t moveBit(unsigned short kc) {
+    switch (kc) {
+        case 126: case 13: return 1;  // up arrow / W
+        case 125: case  1: return 2;  // down arrow / S
+        case 123: case  0: return 4;  // left arrow / A
+        case 124: case  2: return 8;  // right arrow / D
+        default: return 0;
+    }
+}
+
 - (void)keyDown:(NSEvent *)event {
+    // Escape: release mouse capture
+    if (event.keyCode == 53) {
+        if (_mouseCaptured) {
+            _mouseCaptured = NO;
+            CGAssociateMouseAndMouseCursorPosition(YES);
+            [NSCursor unhide];
+        }
+        return;
+    }
+    // Terrain mode: arrow/WASD keys drive the camera, don't cycle models
+    BOOL isTerrain = (_scene == 1 && _models.count > 0 && _models[_modelIndex].isTerrain);
+    if (isTerrain) {
+        uint32_t bit = moveBit(event.keyCode);
+        if (bit) { _keysHeld |= bit; return; }
+    }
+    // Advance scene or cycle to next model
     if (_scene == 0) {
         _scene = 1;
     } else if (_models.count > 0) {
         _modelIndex = (_modelIndex + 1) % (NSInteger)_models.count;
     }
+}
+
+- (void)keyUp:(NSEvent *)event {
+    _keysHeld &= ~moveBit(event.keyCode);
+}
+
+- (void)mouseDown:(NSEvent *)event {
+    BOOL isTerrain = (_scene == 1 && _models.count > 0 && _models[_modelIndex].isTerrain);
+    if (isTerrain && !_mouseCaptured) {
+        _mouseCaptured = YES;
+        CGAssociateMouseAndMouseCursorPosition(NO);
+        [NSCursor hide];
+    }
+}
+
+- (void)mouseMoved:(NSEvent *)event {
+    if (!_mouseCaptured) return;
+    _fpYaw   += event.deltaX * 0.003f;
+    _fpPitch += event.deltaY * 0.003f;
+    float limit = (float)(M_PI_2 * 0.95);
+    _fpPitch = fmaxf(-limit, fminf(limit, _fpPitch));
 }
 
 - (CALayer *)makeBackingLayer { return [CAMetalLayer layer]; }
@@ -2042,12 +2104,31 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     simd_float4x4 proj, view, mvp, rotY;
     if (model.isTerrain) {
-        // Top-angle view for terrain: elevated and slightly behind, looking down
-        simd_float3 ctr = model.center;
-        simd_float3 eye = simd_make_float3(ctr.x, ctr.y + model.diameter*0.9f,
-                                            ctr.z + model.diameter*0.5f);
-        proj = logo_mat_perspective(M_PI * 0.5f, aspect, 1.0f, 5000.f);
-        view = logo_mat_lookAt(eye, ctr, simd_make_float3(0,1,0));
+        // FPS camera for terrain exploration
+        if ((NSInteger)_modelIndex != _fpModelIdx) {
+            simd_float3 ctr = model.center;
+            _fpPos    = simd_make_float3(ctr.x, ctr.y + model.diameter * 0.05f, ctr.z);
+            _fpYaw    = 0.0f;
+            _fpPitch  = 0.0f;
+            _fpModelIdx = (NSInteger)_modelIndex;
+        }
+        // Movement: forward/back along full look direction (incl. pitch), strafe horizontal
+        float speed = model.diameter * 0.003f;
+        simd_float3 fwd   = simd_make_float3(sinf(_fpYaw) * cosf(_fpPitch),
+                                              -sinf(_fpPitch),
+                                              -cosf(_fpYaw) * cosf(_fpPitch));
+        simd_float3 right = simd_make_float3( cosf(_fpYaw), 0.f,  sinf(_fpYaw));
+        if (_keysHeld & 1) _fpPos = _fpPos + fwd   * speed;
+        if (_keysHeld & 2) _fpPos = _fpPos - fwd   * speed;
+        if (_keysHeld & 4) _fpPos = _fpPos - right * speed;
+        if (_keysHeld & 8) _fpPos = _fpPos + right * speed;
+        // Look direction with pitch
+        simd_float3 fullFwd = simd_make_float3(
+            sinf(_fpYaw) * cosf(_fpPitch),
+            -sinf(_fpPitch),
+            -cosf(_fpYaw) * cosf(_fpPitch));
+        proj = logo_mat_perspective(M_PI / 3.0f, aspect, 1.0f, 5000.f);
+        view = logo_mat_lookAt(_fpPos, _fpPos + fullFwd, simd_make_float3(0,1,0));
         rotY = matrix_identity_float4x4;
         mvp  = simd_mul(proj, view);
     } else if (hasAnim) {
