@@ -477,9 +477,12 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
                                stringByAppendingPathComponent:@"Assets"];
         if ([mode isEqualToString:@"levels"]) {
             NSString *dir = [assetsDir stringByAppendingPathComponent:@"Levels"];
-            for (NSString *name in [[NSFileManager.defaultManager
-                    contentsOfDirectoryAtPath:dir error:nil]
-                    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
+            NSError *dirErr = nil;
+            NSArray *levelFiles = [[NSFileManager.defaultManager
+                    contentsOfDirectoryAtPath:dir error:&dirErr]
+                    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+            if (dirErr) NSLog(@"LogoIntroView: cannot list Levels dir: %@", dirErr);
+            for (NSString *name in levelFiles) {
                 if ([name hasPrefix:@"."]) continue;
                 MetaModel *m = [self loadTerrainFromPath:[dir stringByAppendingPathComponent:name]];
                 if (m) [loadedModels addObject:m];
@@ -487,9 +490,12 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
         } else {
             NSString *subdir = [mode isEqualToString:@"boats"] ? @"Boats" : @"Characters";
             NSString *dir = [assetsDir stringByAppendingPathComponent:subdir];
-            for (NSString *name in [[NSFileManager.defaultManager
-                    contentsOfDirectoryAtPath:dir error:nil]
-                    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
+            NSError *dirErr = nil;
+            NSArray *modelFiles = [[NSFileManager.defaultManager
+                    contentsOfDirectoryAtPath:dir error:&dirErr]
+                    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+            if (dirErr) NSLog(@"LogoIntroView: cannot list %@ dir: %@", subdir, dirErr);
+            for (NSString *name in modelFiles) {
                 if ([name hasPrefix:@"."]) continue;
                 MetaModel *m = [self loadModelFromPath:[dir stringByAppendingPathComponent:name]];
                 if (m) [loadedModels addObject:m];
@@ -708,7 +714,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
 
     const uint8_t *b   = data.bytes;
     NSUInteger     len = data.length;
-    if (len < 16) return NO;
+    if (len < 16) { NSLog(@"LogoIntro: 'Logo Intro' file is too short (%lu bytes)", (unsigned long)len); return NO; }
 
     _whiteTex = [self makeWhiteTexture];
 
@@ -1008,7 +1014,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
 
     const uint8_t *b   = data.bytes;
     NSUInteger     len = data.length;
-    if (len < 16) return nil;
+    if (len < 16) { NSLog(@"MetaModel: file too short (%lu bytes) at %@", (unsigned long)len, path); return nil; }
 
     int32_t  ttPos    = mf_s32(b + 8);
     uint32_t tagCount = mf_u32(b + ttPos);
@@ -1190,7 +1196,8 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
 
 - (nullable MetaModel *)loadTerrainFromPath:(NSString *)path {
     NSData *nsData = [NSData dataWithContentsOfFile:path];
-    if (!nsData || nsData.length < 16) return nil;
+    if (!nsData) { NSLog(@"Terrain: not found at %@", path); return nil; }
+    if (nsData.length < 16) { NSLog(@"Terrain: file too short (%lu bytes) at %@", (unsigned long)nsData.length, path); return nil; }
     const uint8_t *b   = nsData.bytes;
     NSUInteger     len = nsData.length;
 
@@ -1419,7 +1426,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
 #undef TERRAIN_EMIT_MESH
 
     free(megas);
-    if (shIdx == 0) return nil;
+    if (shIdx == 0) { NSLog(@"Terrain: no meshes emitted from %@", path); return nil; }
     model.shapeCount = shIdx;
     model.center     = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
     model.diameter   = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
@@ -1568,7 +1575,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         }
     }
     if (foundScrpIdx == UINT32_MAX) {
-        NSLog(@"  No LpC1/LpCd script found in %@", @"");
+        NSLog(@"  No LpC1/LpCd script found");
         return;
     }
 
