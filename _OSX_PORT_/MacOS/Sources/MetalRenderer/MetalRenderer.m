@@ -1249,36 +1249,6 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
     if (skelShapeIdx < 0 && model.shapeCount > 0) skelShapeIdx = 0;
     model.skelShapeIdx = skelShapeIdx;
 
-    // Recompute center/diameter from skeleton bind-pose world positions
-    if (skel->pointCount > 0) {
-        // Build bind-pose world matrices (parent index always < child index)
-        simd_float4x4 bworld[WR_MAX_NODES];
-        for (uint32_t ni = 0; ni < skel->nodeCount; ni++) {
-            float (*m)[3] = skel->nodes[ni].bindMat;
-            simd_float4x4 local = (simd_float4x4){ .columns = {
-                { m[0][0], m[0][1], m[0][2], 0.f },
-                { m[1][0], m[1][1], m[1][2], 0.f },
-                { m[2][0], m[2][1], m[2][2], 0.f },
-                { m[3][0], m[3][1], m[3][2], 1.f },
-            }};
-            uint32_t par = skel->nodes[ni].parentNode;
-            bworld[ni] = (par < skel->nodeCount) ? simd_mul(bworld[par], local) : local;
-        }
-        float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
-        float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
-        for (uint32_t pi = 0; pi < skel->pointCount; pi++) {
-            uint32_t ni = model.vtxNode ? model.vtxNode[pi] : 0;
-            if (ni >= skel->nodeCount) ni = 0;
-            simd_float4 wp = simd_mul(bworld[ni],
-                (simd_float4){skel->pts[pi*3], skel->pts[pi*3+1], skel->pts[pi*3+2], 1.f});
-            bxn=fminf(bxn,wp.x); bxx=fmaxf(bxx,wp.x);
-            byn=fminf(byn,wp.y); byx=fmaxf(byx,wp.y);
-            bzn=fminf(bzn,wp.z); bzx=fmaxf(bzx,wp.z);
-        }
-        model.center   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
-        model.diameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
-    }
-
     if (skelShapeIdx >= 0) {
         id<MTLBuffer> src = model.vertexBufs[(NSUInteger)skelShapeIdx];
         model.animVertBuf = [_device newBufferWithLength:src.length
@@ -1358,6 +1328,43 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
     }
     model.animation = anim;
     model.animStart = [NSDate date].timeIntervalSinceReferenceDate;
+
+    // Recompute center/diameter from skeleton animated positions at tick=0
+    if (skel->pointCount > 0) {
+        simd_float4x4 local[WR_MAX_NODES];
+        for (uint32_t ni = 0; ni < skel->nodeCount; ni++) {
+            float (*m)[3] = skel->nodes[ni].bindMat;
+            local[ni] = (simd_float4x4){ .columns = {
+                { m[0][0], m[0][1], m[0][2], 0.f },
+                { m[1][0], m[1][1], m[1][2], 0.f },
+                { m[2][0], m[2][1], m[2][2], 0.f },
+                { m[3][0], m[3][1], m[3][2], 1.f },
+            }};
+        }
+        for (uint32_t ci = 0; ci < anim->chCount; ci++) {
+            WRAnimCh *ch = &anim->channels[ci];
+            if (ch->nodeIndex < skel->nodeCount)
+                local[ch->nodeIndex] = wr_ch_eval(ch, 0);
+        }
+        simd_float4x4 world[WR_MAX_NODES];
+        for (uint32_t ni = 0; ni < skel->nodeCount; ni++) {
+            uint32_t par = skel->nodes[ni].parentNode;
+            world[ni] = (par < skel->nodeCount) ? simd_mul(world[par], local[ni]) : local[ni];
+        }
+        float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
+        float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
+        for (uint32_t pi = 0; pi < skel->pointCount; pi++) {
+            uint32_t ni = model.vtxNode ? model.vtxNode[pi] : 0;
+            if (ni >= skel->nodeCount) ni = 0;
+            simd_float4 wp = simd_mul(world[ni],
+                (simd_float4){skel->pts[pi*3], skel->pts[pi*3+1], skel->pts[pi*3+2], 1.f});
+            bxn=fminf(bxn,wp.x); bxx=fmaxf(bxx,wp.x);
+            byn=fminf(byn,wp.y); byx=fmaxf(byx,wp.y);
+            bzn=fminf(bzn,wp.z); bzx=fmaxf(bzx,wp.z);
+        }
+        model.center   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
+        model.diameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
+    }
     NSLog(@"  Skeleton: %u nodes, %u pts; anim '%s' %u channels, len=%d cs",
           skel->nodeCount, skel->pointCount, idBuf, anim->chCount, anim->length);
 }
