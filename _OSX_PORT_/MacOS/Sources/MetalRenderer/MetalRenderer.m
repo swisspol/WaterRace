@@ -124,6 +124,10 @@ typedef struct {
 @property id<MTLBuffer> animVertBuf;  // shared-storage buffer for CPU skinning
 @property NSInteger     skelShapeIdx; // which shape is driven by the skeleton (-1 if none)
 @property uint32_t     *vtxNode;    // [pointCount] vertex→node index; malloc'd
+// Sky sphere (terrain only)
+@property id<MTLBuffer> skyVtxBuf;
+@property id<MTLBuffer> skyIdxBuf;
+@property uint32_t      skyIdxCount;
 @end
 
 @implementation MetaModel
@@ -171,6 +175,20 @@ static NSString * const kModelShaders =
     "    float3 L = normalize(float3(0.6, 1.0, 0.8));\n"
     "    float  d = max(0.0f, dot(normalize(in.nrm), L));\n"
     "    return float4(c.rgb * (0.35f + 0.65f * d), c.a);\n"
+    "}\n"
+    // Sky sphere: unlit, always renders at far depth (rotation-only view, no translation)
+    "vertex MVout sky_vert(MVin in [[stage_in]], constant MUni &u [[buffer(1)]]) {\n"
+    "    MVout o;\n"
+    "    o.pos = u.mvp * float4(in.pos, 1.0);\n"
+    "    o.pos.z = o.pos.w * 0.9999f;\n"  // force to far plane
+    "    o.nrm = float3(0,1,0);\n"
+    "    o.uv  = in.uv;\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 sky_frag(MVout in [[stage_in]],\n"
+    "                         texture2d<float> tex [[texture(0)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::repeat);\n"
+    "    return float4(tex.sample(s, in.uv).rgb, 1.0);\n"
     "}\n";
 
 // ── Per-shape CPU data ─────────────────────────────────────────────────────────
@@ -474,6 +492,7 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
 
 // ── 3D model pipeline (shared by all rotating model scenes) ───────────────────
 @property id<MTLRenderPipelineState>  modelPipeline;
+@property id<MTLRenderPipelineState>  skyPipeline;
 
 // ── Rotating model scenes ──────────────────────────────────────────────────────
 @property NSArray<MetaModel *>       *models;
@@ -1621,6 +1640,53 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         }
     }
 
+    // ── Sky dome (viewed from inside, matches original kSkyVScale=1.9 dome) ──
+    static const uint8_t kSkyId[4] = {'s','k','y',' '};
+    if (model.texMap[[NSData dataWithBytes:kSkyId length:4]]) {
+        // Original uses a dome: phi goes from 0 to π/kSkyVScale (≈95° from zenith)
+        // UV: u=longitude (x/kLonBands), v=latitude (y/kLatBands, 0=top in Metal)
+        const float kSkyVScale = 1.9f;
+        const int stacks = 12, slices = 24;
+        int vtxCount = (stacks + 1) * (slices + 1);
+        float *sv = malloc((NSUInteger)vtxCount * 32);  // float3 pos, float3 nrm, float2 uv
+        int vi = 0;
+        float radius = model.diameter * 3.0f;
+        for (int st = 0; st <= stacks; ++st) {
+            float phi   = (float)M_PI / kSkyVScale * st / stacks;  // 0 → π/1.9 (dome, not full sphere)
+            float cosPhi= cosf(phi), sinPhi = sinf(phi);
+            for (int sl = 0; sl <= slices; ++sl) {
+                float theta = 2.f * (float)M_PI * sl / slices;  // 0 → 2π
+                float x = sinPhi * sinf(theta);
+                float y = cosPhi;
+                float z = sinPhi * cosf(theta);
+                float *dst = sv + vi * 8;
+                dst[0] = x * radius; dst[1] = y * radius; dst[2] = z * radius;
+                dst[3] = -x; dst[4] = -y; dst[5] = -z;    // inward normal (unused)
+                dst[6] = (float)sl / slices;               // u = longitude (wraps around world)
+                dst[7] = (float)st / stacks;               // v = latitude (0=top in Metal)
+                ++vi;
+            }
+        }
+        int idxCount = stacks * slices * 6;
+        uint32_t *si = malloc((NSUInteger)idxCount * 4);
+        int ii = 0;
+        for (int st = 0; st < stacks; ++st) {
+            for (int sl = 0; sl < slices; ++sl) {
+                uint32_t a = (uint32_t)(st * (slices+1) + sl);
+                uint32_t b2= a + 1;
+                uint32_t c2= a + (uint32_t)(slices+1);
+                uint32_t d2= c2 + 1;
+                // Reversed winding (viewed from inside)
+                si[ii++] = a; si[ii++] = c2; si[ii++] = b2;
+                si[ii++] = b2; si[ii++] = c2; si[ii++] = d2;
+            }
+        }
+        model.skyVtxBuf  = [_device newBufferWithBytes:sv length:(NSUInteger)vtxCount*32 options:0];
+        model.skyIdxBuf  = [_device newBufferWithBytes:si length:(NSUInteger)idxCount*4  options:0];
+        model.skyIdxCount= (uint32_t)idxCount;
+        free(sv); free(si);
+    }
+
     NSLog(@"Terrain '%@': %u meshes, %lu textures, center=(%.0f,%.0f,%.0f), diam=%.0f",
           path.lastPathComponent, shIdx, (unsigned long)model.texMap.count,
           model.center.x, model.center.y, model.center.z, model.diameter);
@@ -1929,6 +1995,12 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
     pd.depthAttachmentPixelFormat      = MTLPixelFormatDepth32Float;
     _modelPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!_modelPipeline) NSLog(@"Model pipeline error: %@", err);
+
+    // Sky pipeline: unlit, same vertex layout
+    pd.vertexFunction   = [lib newFunctionWithName:@"sky_vert"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"sky_frag"];
+    _skyPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!_skyPipeline) NSLog(@"Sky pipeline error: %@", err);
 }
 
 // ── Render loop ───────────────────────────────────────────────────────────────
@@ -2165,6 +2237,33 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+
+    // ── Sky sphere (terrain only) ──────────────────────────────────────────────
+    if (model.isTerrain && model.skyVtxBuf && _skyPipeline) {
+        static const uint8_t kSkyId[4] = {'s','k','y',' '};
+        id<MTLTexture> skyTex = model.texMap[[NSData dataWithBytes:kSkyId length:4]];
+        if (skyTex) {
+            // Rotation-only view (remove translation so sphere stays centered on camera)
+            simd_float3 fullFwd = simd_make_float3(
+                sinf(_fpYaw) * cosf(_fpPitch), -sinf(_fpPitch), -cosf(_fpYaw) * cosf(_fpPitch));
+            simd_float4x4 skyView = logo_mat_lookAt(simd_make_float3(0,0,0), fullFwd,
+                                                    simd_make_float3(0,1,0));
+            ModelUni skyUni = { .mvp = simd_mul(proj, skyView),
+                                .rotY = matrix_identity_float4x4 };
+            [enc setRenderPipelineState:_skyPipeline];
+            [enc setDepthStencilState:_depthStateDisabled];
+            [enc setCullMode:MTLCullModeNone];
+            [enc setVertexBuffer:model.skyVtxBuf offset:0 atIndex:0];
+            [enc setVertexBytes:&skyUni  length:sizeof(skyUni) atIndex:1];
+            [enc setFragmentTexture:skyTex atIndex:0];
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                            indexCount:model.skyIdxCount
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:model.skyIdxBuf
+                     indexBufferOffset:0];
+        }
+    }
+
     [enc setRenderPipelineState:_modelPipeline];
     [enc setDepthStencilState:_depthState];
     [enc setCullMode:MTLCullModeBack];
