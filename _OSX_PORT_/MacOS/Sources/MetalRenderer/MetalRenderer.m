@@ -97,6 +97,7 @@ typedef struct {
 @property NSMutableDictionary<NSData *, id<MTLTexture>> *texMap;
 @property NSUInteger    shapeCount;
 @property ModelShapeData *shapes;   // malloc'd; freed in dealloc
+@property BOOL          isTerrain;  // YES for terrain/level files
 @property simd_float3   center;
 @property float         diameter;
 @property float         angle;      // current rotation angle (updated each frame)
@@ -239,6 +240,22 @@ static simd_float4x4 mat_translate(float tx, float ty, float tz) {
     simd_float4x4 m = matrix_identity_float4x4;
     m.columns[3] = (simd_float4){ tx, ty, tz, 1 };
     return m;
+}
+
+// WR matrix concatenation: A applied first, then B  (row-vector convention)
+// C[i][j] = Σ_k A[i][k]*B[k][j]   for i=0..2
+// C[3][j] = Σ_k A[3][k]*B[k][j] + B[3][j]
+static void mf_mat_concat(const float A[4][3], const float B[4][3], float C[4][3]) {
+    for (int col = 0; col < 3; col++) {
+        for (int row = 0; row < 3; row++) {
+            float s = 0;
+            for (int k = 0; k < 3; k++) s += A[row][k] * B[k][col];
+            C[row][col] = s;
+        }
+        float s = 0;
+        for (int k = 0; k < 3; k++) s += A[3][k] * B[k][col];
+        C[3][col] = s + B[3][col];
+    }
 }
 
 // ── Quaternion helpers ─────────────────────────────────────────────────────────
@@ -453,20 +470,34 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
     if (![self loadAssets] || ![self buildPipeline]) return nil;
     [self buildModelPipeline];
 
-    // Load all model MetaFiles from the Assets directory
     NSString *assetsDir = [NSFileManager.defaultManager.currentDirectoryPath
                            stringByAppendingPathComponent:@"Assets"];
-    NSArray<NSString *> *assetNames = [[NSFileManager.defaultManager
-        contentsOfDirectoryAtPath:assetsDir error:nil]
-        sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
     NSMutableArray<MetaModel *> *loadedModels = [NSMutableArray new];
-    for (NSString *name in assetNames) {
-        if ([name hasPrefix:@"."]) continue;          // skip hidden files
-        if ([name isEqualToString:@"Logo Intro"]) continue;  // already loaded
-        NSString *modelPath = [assetsDir stringByAppendingPathComponent:name];
-        MetaModel *m = [self loadModelFromPath:modelPath];
+
+    // Characters and Boats: loaded as 3D models
+    for (NSString *subdir in @[@"Characters", @"Boats"]) {
+        NSString *dir = [assetsDir stringByAppendingPathComponent:subdir];
+        NSArray<NSString *> *names = [[NSFileManager.defaultManager
+            contentsOfDirectoryAtPath:dir error:nil]
+            sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+        for (NSString *name in names) {
+            if ([name hasPrefix:@"."]) continue;
+            MetaModel *m = [self loadModelFromPath:[dir stringByAppendingPathComponent:name]];
+            if (m) [loadedModels addObject:m];
+        }
+    }
+
+    // Levels: loaded as terrain scenes
+    NSString *levelsDir = [assetsDir stringByAppendingPathComponent:@"Levels"];
+    NSArray<NSString *> *levelNames = [[NSFileManager.defaultManager
+        contentsOfDirectoryAtPath:levelsDir error:nil]
+        sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    for (NSString *name in levelNames) {
+        if ([name hasPrefix:@"."]) continue;
+        MetaModel *m = [self loadTerrainFromPath:[levelsDir stringByAppendingPathComponent:name]];
         if (m) [loadedModels addObject:m];
     }
+
     _models     = [loadedModels copy];
     _modelIndex = 0;
     _scene      = 0;   // start with logo intro
@@ -1154,6 +1185,274 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
     return model;
 }
 
+// ── Terrain MetaFile loader ───────────────────────────────────────────────────
+// Handles terrain files with tmsh/smsh geometry patches (world-space vertices)
+// and mega-object instances placed at ModelReference transform positions.
+
+- (nullable MetaModel *)loadTerrainFromPath:(NSString *)path {
+    NSData *nsData = [NSData dataWithContentsOfFile:path];
+    if (!nsData || nsData.length < 16) return nil;
+    const uint8_t *b   = nsData.bytes;
+    NSUInteger     len = nsData.length;
+
+    int32_t ttPos = mf_s32(b + 8);
+    if (ttPos < 0 || (NSUInteger)ttPos + 4 > len) return nil;
+    uint32_t   tagCount = mf_u32(b + (NSUInteger)ttPos);
+    NSUInteger eBase    = (NSUInteger)ttPos + 4;
+
+    // Must be a terrain file (first tag = 'terr')
+    if (tagCount == 0 || !mf_4cc(b + eBase + 4, "terr")) return nil;
+
+    // ── Step 1: Build mega-id → shape-template map ───────────────────────────
+    // Templates store geometry offsets + local transform; instantiated later.
+    typedef struct {
+        int32_t  pc, tc, pntsPos, trigPos, nrlsPos, nrlsSize;
+        float    mat[4][3];   // local-to-parent WR row-major
+        uint8_t  texId[4];
+    } TmpShp;
+    typedef struct {
+        uint8_t  id[4];
+        uint32_t count;
+        TmpShp   shapes[8];
+    } TmpMega;
+
+    TmpMega *megas = calloc(200, sizeof(TmpMega));
+    uint32_t megaCount = 0;
+
+    for (uint32_t i = 0; i < tagCount && megaCount < 200; ++i) {
+        const uint8_t *me = b + eBase + i*24;
+        if (eBase + i*24 + 24 > len) break;
+        if (!mf_4cc(me + 4, "mega")) continue;
+
+        TmpMega *tm = &megas[megaCount++];
+        memcpy(tm->id, me + 12, 4);
+        uint8_t megaDepth = me[0];
+
+        for (uint32_t j = i+1; j < tagCount && tm->count < 8; ++j) {
+            const uint8_t *ce = b + eBase + j*24;
+            if (eBase + j*24 + 24 > len) break;
+            if (ce[0] <= megaDepth) break;
+            if (!mf_4cc(ce + 4, "shap")) continue;
+
+            int32_t spos = mf_s32(ce + 20);
+            if (spos < 0 || (NSUInteger)spos + 300 > len) continue;
+            const uint8_t *sh = b + spos;
+            uint16_t shading = (uint16_t)(sh[226]<<8 | sh[227]);
+            if (shading >= 16) continue;
+            int32_t pc = mf_s32(sh + 0), tc = mf_s32(sh + 8);
+            if (pc <= 0 || tc <= 0) continue;
+
+            uint8_t cdepth = ce[0] + 1;
+            int32_t pntsPos=-1, trigPos=-1, nrlsPos=-1, nrlsSize=0;
+            for (uint32_t k = j+1; k < tagCount; ++k) {
+                const uint8_t *ke = b + eBase + k*24;
+                if (ke[0] < cdepth) break;
+                if (!mf_4cc(ke + 4, "<-->")) continue;
+                int32_t kpos = mf_s32(ke+20), ksz = mf_s32(ke+16);
+                if (mf_4cc(ke+8, "pnts") && pntsPos < 0) pntsPos = kpos;
+                if (mf_4cc(ke+8, "trig") && trigPos < 0) trigPos = kpos;
+                if (mf_4cc(ke+8, "nrls") && nrlsPos < 0) { nrlsPos = kpos; nrlsSize = ksz; }
+            }
+            if (pntsPos < 0 || trigPos < 0) continue;
+            if ((NSUInteger)pntsPos + pc*24 > len || (NSUInteger)trigPos + tc*12 > len) continue;
+
+            TmpShp *ts = &tm->shapes[tm->count++];
+            ts->pc = pc; ts->tc = tc;
+            ts->pntsPos = pntsPos; ts->trigPos = trigPos;
+            ts->nrlsPos = nrlsPos; ts->nrlsSize = nrlsSize;
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 3; c++)
+                    ts->mat[r][c] = mf_f32(sh + 36 + (r*3+c)*4);
+            memcpy(ts->texId, sh + 200, 4);
+        }
+    }
+
+    // ── Step 2: Build vertex/index buffers for each patch and instance ────────
+    MetaModel *model = [MetaModel new];
+    model.isTerrain  = YES;
+    model.shapes     = calloc(800, sizeof(ModelShapeData));
+    uint32_t shIdx   = 0;
+    float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
+    float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
+
+    // Inline helper: emit one mesh (pnts/nrls/trig + world transform)
+#define TERRAIN_EMIT_MESH(pc_, tc_, pnts_, nrls_, trig_, mat_, texId_) \
+    do { \
+        int32_t _pc = (pc_); int32_t _tc = (tc_); \
+        const uint8_t *_pnts = (pnts_); const uint8_t *_nrls = (nrls_); \
+        const uint8_t *_trig = (trig_); float (*_mat)[3] = (mat_); \
+        float *_computed = NULL; \
+        if (!_nrls) { \
+            _computed = calloc(_pc * 3, sizeof(float)); \
+            for (int _ti=0; _ti<_tc; _ti++) { \
+                uint32_t _ai=mf_u32(_trig+_ti*12), _bi=mf_u32(_trig+_ti*12+4), _ci=mf_u32(_trig+_ti*12+8); \
+                if(_ai>=(uint32_t)_pc||_bi>=(uint32_t)_pc||_ci>=(uint32_t)_pc) continue; \
+                float _ap[3]={mf_f32(_pnts+_ai*24),mf_f32(_pnts+_ai*24+4),mf_f32(_pnts+_ai*24+8)}; \
+                float _bp[3]={mf_f32(_pnts+_bi*24),mf_f32(_pnts+_bi*24+4),mf_f32(_pnts+_bi*24+8)}; \
+                float _cp[3]={mf_f32(_pnts+_ci*24),mf_f32(_pnts+_ci*24+4),mf_f32(_pnts+_ci*24+8)}; \
+                float _aw[3],_bw[3],_cw[3]; \
+                mf_xform_pt(_ap,_mat,_aw); mf_xform_pt(_bp,_mat,_bw); mf_xform_pt(_cp,_mat,_cw); \
+                float _ux=_bw[0]-_aw[0],_uy=_bw[1]-_aw[1],_uz=_bw[2]-_aw[2]; \
+                float _vx=_cw[0]-_aw[0],_vy=_cw[1]-_aw[1],_vz=_cw[2]-_aw[2]; \
+                float _nx=_uy*_vz-_uz*_vy,_ny=_uz*_vx-_ux*_vz,_nz=_ux*_vy-_uy*_vx; \
+                uint32_t _f[3]={_ai,_bi,_ci}; \
+                for(int _fi=0;_fi<3;_fi++){_computed[_f[_fi]*3]+=_nx;_computed[_f[_fi]*3+1]+=_ny;_computed[_f[_fi]*3+2]+=_nz;} \
+            } \
+            for(int _vi=0;_vi<_pc;_vi++){float*_n=_computed+_vi*3;float _l=sqrtf(_n[0]*_n[0]+_n[1]*_n[1]+_n[2]*_n[2]);if(_l>1e-6f){_n[0]/=_l;_n[1]/=_l;_n[2]/=_l;}else{_n[0]=0;_n[1]=1;_n[2]=0;}} \
+        } \
+        float *_vbuf = malloc(_pc * 32); \
+        for (int _vi=0; _vi<_pc; _vi++) { \
+            const uint8_t *_vp = _pnts + _vi*24; \
+            float _lp[3]={mf_f32(_vp),mf_f32(_vp+4),mf_f32(_vp+8)}, _wp[3]; mf_xform_pt(_lp,_mat,_wp); \
+            float _wn[3]; \
+            if (_nrls) { float _ln[3]={mf_f32(_nrls+_vi*12),mf_f32(_nrls+_vi*12+4),mf_f32(_nrls+_vi*12+8)}; mf_xform_nrm(_ln,_mat,_wn); } \
+            else { _wn[0]=_computed[_vi*3];_wn[1]=_computed[_vi*3+1];_wn[2]=_computed[_vi*3+2]; } \
+            float *_dst=_vbuf+_vi*8; \
+            _dst[0]=_wp[0];_dst[1]=_wp[1];_dst[2]=_wp[2]; \
+            _dst[3]=_wn[0];_dst[4]=_wn[1];_dst[5]=_wn[2]; \
+            _dst[6]=mf_f32(_vp+12); _dst[7]=1.0f-mf_f32(_vp+16); \
+            bxn=fminf(bxn,_wp[0]);bxx=fmaxf(bxx,_wp[0]); \
+            byn=fminf(byn,_wp[1]);byx=fmaxf(byx,_wp[1]); \
+            bzn=fminf(bzn,_wp[2]);bzx=fmaxf(bzx,_wp[2]); \
+        } \
+        free(_computed); \
+        [model.vertexBufs addObject:[_device newBufferWithBytes:_vbuf length:_pc*32 options:0]]; \
+        free(_vbuf); \
+        uint32_t *_ibuf = malloc(_tc * 12); \
+        for(int _ti=0;_ti<_tc;_ti++){_ibuf[_ti*3]=mf_u32(_trig+_ti*12);_ibuf[_ti*3+1]=mf_u32(_trig+_ti*12+4);_ibuf[_ti*3+2]=mf_u32(_trig+_ti*12+8);} \
+        [model.indexBufs addObject:[_device newBufferWithBytes:_ibuf length:_tc*12 options:0]]; \
+        free(_ibuf); \
+        if (shIdx < 800) { \
+            ModelShapeData *_sd = &model.shapes[shIdx++]; \
+            memset(_sd->shape_id, 0, 4); \
+            memcpy(_sd->tex_id, (texId_), 4); \
+            _sd->index_count = (uint32_t)_tc * 3; \
+        } \
+    } while(0)
+
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i*24;
+        if (eBase + i*24 + 24 > len) break;
+        BOOL isMesh = mf_4cc(e+4, "tmsh") || mf_4cc(e+4, "smsh");
+        if (!isMesh) continue;
+
+        int32_t epos = mf_s32(e+20); int32_t esz_s = mf_s32(e+16);
+        if (epos < 0 || esz_s <= 0 || (NSUInteger)epos+(NSUInteger)esz_s > len) continue;
+        NSUInteger esz = (NSUInteger)esz_s;
+
+        // Texture id at offset 232 in tmsh/smsh struct
+        uint8_t meshTex[4];
+        if ((NSUInteger)epos + 236 <= len) memcpy(meshTex, b + epos + 232, 4);
+        else memset(meshTex, 0, 4);
+
+        // Find pnts/trig/nrls child tags for terrain patch geometry
+        uint8_t cdepth = e[0] + 1;
+        int32_t pntsPos=-1, trigPos=-1, nrlsPos=-1, nrlsSize=0;
+        for (uint32_t j = i+1; j < tagCount; ++j) {
+            const uint8_t *ce = b + eBase + j*24;
+            if (ce[0] < cdepth) break;
+            if (!mf_4cc(ce+4, "<-->")) continue;
+            int32_t cpos = mf_s32(ce+20), csz = mf_s32(ce+16);
+            if (mf_4cc(ce+8, "pnts") && pntsPos < 0) pntsPos = cpos;
+            if (mf_4cc(ce+8, "trig") && trigPos < 0) trigPos = cpos;
+            if (mf_4cc(ce+8, "nrls") && nrlsPos < 0) { nrlsPos = cpos; nrlsSize = csz; }
+        }
+
+        // Terrain patch: vertices already in world space → identity transform
+        if (pntsPos >= 0 && trigPos >= 0) {
+            // Derive pc/tc from tag sizes (pnts = pc*24, trig = tc*12)
+            // We use pointCount from the mesh struct (offset 112) as ground truth
+            if ((NSUInteger)epos + 128 <= len) {
+                int32_t pc = mf_s32(b + epos + 112);
+                int32_t tc = mf_s32(b + epos + 124);
+                if (pc > 0 && tc > 0 &&
+                    (NSUInteger)pntsPos + pc*24 <= len &&
+                    (NSUInteger)trigPos + tc*12 <= len) {
+                    const uint8_t *nrls = (nrlsPos >= 0 && nrlsSize >= pc*12 &&
+                                          (NSUInteger)nrlsPos + pc*12 <= len) ? b+nrlsPos : NULL;
+                    static const float kIdentity[4][3] = {{1,0,0},{0,1,0},{0,0,1},{0,0,0}};
+                    TERRAIN_EMIT_MESH(pc, tc, b+pntsPos, nrls, b+trigPos,
+                                      (float(*)[3])kIdentity, meshTex);
+                }
+            }
+        }
+
+        // Placed mega-object instances from ModelReference list
+        NSUInteger rcOff = (esz == 12796) ? 504 : 500;  // smsh has extra field
+        NSUInteger rlOff = (esz == 12796) ? 508 : 504;
+        if ((NSUInteger)epos + rcOff + 4 > len) continue;
+        uint32_t refCount = mf_u32(b + (NSUInteger)epos + rcOff);
+        if (refCount > 128) refCount = 128;
+
+        for (uint32_t r = 0; r < refCount; ++r) {
+            NSUInteger roff = (NSUInteger)epos + rlOff + r*96;
+            if (roff + 52 > len) break;
+
+            // Reference world matrix at offset 12 within ModelReference struct
+            float refMat[4][3];
+            for (int row = 0; row < 4; row++)
+                for (int col = 0; col < 3; col++)
+                    refMat[row][col] = mf_f32(b + roff + 12 + (row*3+col)*4);
+
+            // Find matching mega by ID
+            for (uint32_t m2 = 0; m2 < megaCount; ++m2) {
+                if (memcmp(megas[m2].id, b + roff, 4) != 0) continue;
+                TmpMega *tm = &megas[m2];
+                for (uint32_t s = 0; s < tm->count; ++s) {
+                    TmpShp *ts = &tm->shapes[s];
+                    // Combined world matrix: shape-local × reference
+                    float combined[4][3];
+                    mf_mat_concat(ts->mat, refMat, combined);
+                    if ((NSUInteger)ts->pntsPos + ts->pc*24 <= len &&
+                        (NSUInteger)ts->trigPos + ts->tc*12 <= len) {
+                        const uint8_t *nrls = (ts->nrlsPos >= 0 && ts->nrlsSize >= ts->pc*12 &&
+                                               (NSUInteger)ts->nrlsPos + ts->pc*12 <= len)
+                                              ? b + ts->nrlsPos : NULL;
+                        TERRAIN_EMIT_MESH(ts->pc, ts->tc,
+                                          b+ts->pntsPos, nrls, b+ts->trigPos,
+                                          combined, ts->texId);
+                    }
+                }
+                break;
+            }
+        }
+    }
+#undef TERRAIN_EMIT_MESH
+
+    free(megas);
+    if (shIdx == 0) return nil;
+    model.shapeCount = shIdx;
+    model.center     = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
+    model.diameter   = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
+
+    // ── Textures (same cptx/txim parsing as loadModelFromPath) ───────────────
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i*24;
+        if (eBase + i*24 + 24 > len) break;
+        if (!mf_4cc(e + 4, "cptx")) continue;
+        uint8_t cptxDepth = e[0];
+        for (uint32_t j = i+1; j < tagCount; ++j) {
+            const uint8_t *ne = b + eBase + j*24;
+            if (eBase + j*24 + 24 > len) break;
+            if (ne[0] <= cptxDepth && !mf_4cc(ne+4, "<-->")) break;
+            if (!mf_4cc(ne+4, "<-->") || !mf_4cc(ne+8, "txim")) continue;
+            int32_t tpos = mf_s32(ne+20), tsz = mf_s32(ne+16);
+            if (tpos < 0 || tsz < 12 || (NSUInteger)tpos+tsz > len) break;
+            id<MTLTexture> tex = [self loadTextureFromPICT:b+tpos length:(NSUInteger)tsz];
+            if (tex) {
+                NSData *key = [NSData dataWithBytes:e+12 length:4];
+                if (!model.texMap[key]) model.texMap[key] = tex;
+            }
+            break;
+        }
+    }
+
+    NSLog(@"Terrain '%@': %u meshes, %lu textures, center=(%.0f,%.0f,%.0f), diam=%.0f",
+          path.lastPathComponent, shIdx, (unsigned long)model.texMap.count,
+          model.center.x, model.center.y, model.center.z, model.diameter);
+    return model;
+}
+
 // ── Skeleton + animation loader ───────────────────────────────────────────────
 // Finds sklt tag, parses Skeleton_Definition and the first LpC1/LpCd script.
 // Builds CPU-writable animVertBuf for per-frame skinning.
@@ -1561,10 +1860,10 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     BOOL hasAnim = (model.animation != nil && model.skeleton != nil);
 
-    // For animated characters: CPU-skin this frame; for static models: spin.
+    // For animated characters: CPU-skin this frame; for static models: spin (not terrain).
     if (hasAnim) {
         [self updateAnimBufs:model];
-    } else {
+    } else if (!model.isTerrain) {
         model.angle += 0.008f;
     }
 
@@ -1585,7 +1884,16 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     float camDist = model.diameter * 1.6f;
 
     simd_float4x4 proj, view, mvp, rotY;
-    if (hasAnim) {
+    if (model.isTerrain) {
+        // Top-angle view for terrain: elevated and slightly behind, looking down
+        simd_float3 ctr = model.center;
+        simd_float3 eye = simd_make_float3(ctr.x, ctr.y + model.diameter*0.9f,
+                                            ctr.z + model.diameter*0.5f);
+        proj = logo_mat_perspective(M_PI * 0.5f, aspect, 1.0f, 5000.f);
+        view = logo_mat_lookAt(eye, ctr, simd_make_float3(0,1,0));
+        rotY = matrix_identity_float4x4;
+        mvp  = simd_mul(proj, view);
+    } else if (hasAnim) {
         // Static front-facing camera: slightly elevated, looking at character center
         simd_float3 ctr = model.center;
         simd_float3 eye = simd_make_float3(ctr.x, ctr.y + model.diameter*0.1f,
