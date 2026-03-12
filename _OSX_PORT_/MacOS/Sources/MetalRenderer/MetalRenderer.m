@@ -41,8 +41,51 @@ static NSString * const kLogoShaders =
 
 // ── Uniform structs ────────────────────────────────────────────────────────────
 typedef struct { simd_float4x4 model; simd_float4x4 vp; } LogoUni;
+// ── Animation keyframe (shared by logo intro and skeleton animation) ──────────
+typedef struct {
+    int32_t  time_cs;
+    float    qw, qx, qy, qz;
+    float    px, py, pz;
+} __attribute__((packed)) LogoKF;
+
+// ── WaterRace skeleton & animation ───────────────────────────────────────────
+#define WR_MAX_NODES 40
+
+typedef struct {
+    uint32_t parentNode;        // 0xFFFFFFFF = root sentinel
+    uint32_t childNodeCount;
+    uint32_t childNodeList[6];
+    float    bindMat[4][3];     // rest-pose local-to-parent, WR row-major
+    uint32_t verticeCount;
+    uint32_t verticeList[128];  // indices into skeleton points[]
+    char     name[32];
+} WRNode;
+
+typedef struct {
+    uint32_t  nodeCount;
+    WRNode    nodes[WR_MAX_NODES];
+    uint32_t  pointCount;
+    float    *pts;              // bone-local positions [pointCount*3]; malloc'd
+    float    *nrms;             // bone-local normals   [pointCount*3]; malloc'd
+    uint8_t   shapeID[4];
+} WRSkeleton;
+
+typedef struct {
+    uint32_t  nodeIndex;
+    int32_t   endTime;
+    uint32_t  eventCount;
+    LogoKF   *events;           // malloc'd
+} WRAnimCh;
+
+typedef struct {
+    int32_t   length;           // total duration in centiseconds
+    uint32_t  chCount;
+    WRAnimCh *channels;         // malloc'd
+} WRAnim;
+
 // ── Per-shape data for rotating models ───────────────────────────────────────
 typedef struct {
+    uint8_t  shape_id[4];
     uint8_t  tex_id[4];
     uint32_t index_count;
 } ModelShapeData;
@@ -57,17 +100,34 @@ typedef struct {
 @property simd_float3   center;
 @property float         diameter;
 @property float         angle;      // current rotation angle (updated each frame)
+// Skeleton animation
+@property WRSkeleton   *skeleton;   // NULL if no skeleton
+@property WRAnim       *animation;  // NULL if no animation
+@property double        animStart;
+@property id<MTLBuffer> animVertBuf;  // shared-storage buffer for CPU skinning
+@property NSInteger     skelShapeIdx; // which shape is driven by the skeleton (-1 if none)
+@property uint32_t     *vtxNode;    // [pointCount] vertex→node index; malloc'd
 @end
 
 @implementation MetaModel
 - (instancetype)init {
     if (!(self = [super init])) return nil;
-    _vertexBufs = [NSMutableArray new];
-    _indexBufs  = [NSMutableArray new];
-    _texMap     = [NSMutableDictionary new];
+    _vertexBufs    = [NSMutableArray new];
+    _indexBufs     = [NSMutableArray new];
+    _texMap        = [NSMutableDictionary new];
+    _skelShapeIdx  = -1;
     return self;
 }
-- (void)dealloc { free(_shapes); }
+- (void)dealloc {
+    free(_shapes);
+    if (_skeleton) { free(_skeleton->pts); free(_skeleton->nrms); free(_skeleton); }
+    if (_animation) {
+        for (uint32_t i = 0; i < _animation->chCount; i++) free(_animation->channels[i].events);
+        free(_animation->channels);
+        free(_animation);
+    }
+    free(_vtxNode);
+}
 @end
 
 // ── Model shaders (float3 pos, float3 nrm, float2 uv; rotates around Y) ───────
@@ -95,13 +155,6 @@ static NSString * const kModelShaders =
     "    float  d = max(0.0f, dot(normalize(in.nrm), L));\n"
     "    return float4(c.rgb * (0.35f + 0.65f * d), c.a);\n"
     "}\n";
-
-// ── Animation keyframe ────────────────────────────────────────────────────────
-typedef struct {
-    int32_t  time_cs;
-    float    qw, qx, qy, qz;
-    float    px, py, pz;
-} __attribute__((packed)) LogoKF;
 
 // ── Per-shape CPU data ─────────────────────────────────────────────────────────
 typedef struct {
@@ -293,6 +346,56 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     return logo_quat_to_matrix(e->qw, e->qx, e->qy, e->qz, e->px, e->py, e->pz);
 }
 
+// Euler-angles → Metal matrix for WR skeleton keyframes.
+// WR stores rotation as (rotateX, rotateY, rotateZ) Euler angles in radians.
+// Convention: applied in X-then-Y-then-Z order (WR row-vector), which in
+// Metal column-vector convention becomes Rz * Ry * Rx.
+static simd_float4x4 wr_euler_to_matrix(float ex, float ey, float ez,
+                                         float tx, float ty, float tz)
+{
+    float cx = cosf(ex), sx = sinf(ex);
+    float cy = cosf(ey), sy = sinf(ey);
+    float cz = cosf(ez), sz = sinf(ez);
+    // Rz*Ry*Rx expanded, stored as Metal column-major
+    return (simd_float4x4){ .columns = {
+        { cz*cy,                    sz*cy,                    -sy,       0.f },
+        { sx*sy*cz - cx*sz,         sx*sy*sz + cx*cz,          sx*cy,    0.f },
+        { cx*sy*cz + sx*sz,         cx*sy*sz - sx*cz,          cx*cy,    0.f },
+        { tx, ty, tz, 1.f },
+    }};
+}
+
+// Evaluate one WRAnimCh at time t (centiseconds) → local transform matrix.
+// Rotation fields (stored in qw/qx/qy of LogoKF) are Euler angles (ex,ey,ez),
+// not quaternion components. rotateW (qz) is always 0 and unused.
+static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
+    uint32_t ec = ch->eventCount;
+    if (ec == 0) return matrix_identity_float4x4;
+    LogoKF *evs = ch->events;
+    if (t >= ch->endTime || t >= evs[ec-1].time_cs) {
+        LogoKF *e = &evs[ec-1];
+        return wr_euler_to_matrix(e->qw, e->qx, e->qy, e->px, e->py, e->pz);
+    }
+    if (ec < 2 || t <= evs[0].time_cs) {
+        LogoKF *e = &evs[0];
+        return wr_euler_to_matrix(e->qw, e->qx, e->qy, e->px, e->py, e->pz);
+    }
+    for (int j = (int)ec-2; j >= 0; --j) {
+        if (t >= evs[j].time_cs) {
+            float dt = (float)(t - evs[j].time_cs) / (float)(evs[j+1].time_cs - evs[j].time_cs);
+            float ex = evs[j].qw + (evs[j+1].qw - evs[j].qw)*dt;
+            float ey = evs[j].qx + (evs[j+1].qx - evs[j].qx)*dt;
+            float ez = evs[j].qy + (evs[j+1].qy - evs[j].qy)*dt;
+            float px = evs[j].px + (evs[j+1].px - evs[j].px)*dt;
+            float py = evs[j].py + (evs[j+1].py - evs[j].py)*dt;
+            float pz = evs[j].pz + (evs[j+1].pz - evs[j].pz)*dt;
+            return wr_euler_to_matrix(ex, ey, ez, px, py, pz);
+        }
+    }
+    LogoKF *e = &evs[0];
+    return wr_euler_to_matrix(e->qw, e->qx, e->qy, e->px, e->py, e->pz);
+}
+
 // ── LogoIntroView ──────────────────────────────────────────────────────────────
 
 @interface LogoIntroView () {
@@ -349,20 +452,24 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 
     if (![self loadAssets] || ![self buildPipeline]) return nil;
     [self buildModelPipeline];
+
+    // Load all model MetaFiles from the Assets directory
     NSString *assetsDir = [NSFileManager.defaultManager.currentDirectoryPath
                            stringByAppendingPathComponent:@"Assets"];
-    NSArray<NSString *> *entries = [[NSFileManager.defaultManager
+    NSArray<NSString *> *assetNames = [[NSFileManager.defaultManager
         contentsOfDirectoryAtPath:assetsDir error:nil]
         sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
     NSMutableArray<MetaModel *> *loadedModels = [NSMutableArray new];
-    for (NSString *name in entries) {
-        if ([name isEqualToString:@"Logo Intro"]) continue;
-        NSString *path = [assetsDir stringByAppendingPathComponent:name];
-        MetaModel *m = [self loadModelFromPath:path];
+    for (NSString *name in assetNames) {
+        if ([name hasPrefix:@"."]) continue;          // skip hidden files
+        if ([name isEqualToString:@"Logo Intro"]) continue;  // already loaded
+        NSString *modelPath = [assetsDir stringByAppendingPathComponent:name];
+        MetaModel *m = [self loadModelFromPath:modelPath];
         if (m) [loadedModels addObject:m];
     }
     _models     = [loadedModels copy];
     _modelIndex = 0;
+    _scene      = 0;   // start with logo intro
 
     _startTime = [NSDate date];
     CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
@@ -1006,6 +1113,7 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
         free(ibuf);
 
         ModelShapeData *sd = &model.shapes[shapIdx];
+        memcpy(sd->shape_id, e + 12, 4);
         memcpy(sd->tex_id, sh + 200, 4);
         sd->index_count = (uint32_t)tc * 3;
         shapIdx++;
@@ -1035,11 +1143,289 @@ static void packbits_words(const uint8_t *src, uint32_t srcLen,
             break;
         }
     }
-    NSLog(@"MetaModel '%@': %lu shapes, %lu textures, center=(%.1f,%.1f,%.1f), diam=%.1f",
+    // Try to load skeleton + animation (LpC1 or LpCd)
+    [self parseSkeletonAnimFromData:b length:len tagCount:tagCount eBase:eBase intoModel:model];
+
+    NSLog(@"MetaModel '%@': %lu shapes, %lu textures%s, center=(%.1f,%.1f,%.1f), diam=%.1f",
           path.lastPathComponent, (unsigned long)model.shapeCount,
           (unsigned long)model.texMap.count,
+          model.animation ? ", animated" : "",
           model.center.x, model.center.y, model.center.z, model.diameter);
     return model;
+}
+
+// ── Skeleton + animation loader ───────────────────────────────────────────────
+// Finds sklt tag, parses Skeleton_Definition and the first LpC1/LpCd script.
+// Builds CPU-writable animVertBuf for per-frame skinning.
+
+- (void)parseSkeletonAnimFromData:(const uint8_t *)b length:(NSUInteger)len
+                         tagCount:(uint32_t)tagCount eBase:(NSUInteger)eBase
+                        intoModel:(MetaModel *)model
+{
+    // ── 1. Find sklt entry ─────────────────────────────────────────────────
+    uint32_t skltIdx = UINT32_MAX;
+    for (uint32_t i = 0; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i*24;
+        if (eBase + i*24 + 24 > len) break;
+        if (mf_4cc(e+4, "sklt")) { skltIdx = i; break; }
+    }
+    if (skltIdx == UINT32_MAX) return;
+
+    const uint8_t *se    = b + eBase + skltIdx*24;
+    int32_t        sdpos = mf_s32(se + 20);
+    int32_t        sdsz  = mf_s32(se + 16);
+    // Skeleton fixed header: 16 + 40*640 + 16 = 25,632 bytes minimum
+    if (sdpos < 0 || sdsz < 25632 || (NSUInteger)sdpos + sdsz > len) return;
+
+    const uint8_t *sd = b + sdpos;
+
+    WRSkeleton *skel = calloc(1, sizeof(WRSkeleton));
+    memcpy(skel->shapeID, sd + 8, 4);
+    skel->nodeCount = mf_u32(sd + 12);
+    if (skel->nodeCount > WR_MAX_NODES) skel->nodeCount = WR_MAX_NODES;
+
+    for (uint32_t ni = 0; ni < skel->nodeCount; ++ni) {
+        const uint8_t *nd = sd + 16 + ni * 640;
+        WRNode *node = &skel->nodes[ni];
+        node->parentNode     = mf_u32(nd + 0);
+        node->childNodeCount = mf_u32(nd + 4);
+        for (int ci = 0; ci < 6; ci++)
+            node->childNodeList[ci] = mf_u32(nd + 8 + ci*4);
+        // Matrix at +32: 4 rows × 3 floats each
+        for (int r = 0; r < 4; r++)
+            for (int c = 0; c < 3; c++)
+                node->bindMat[r][c] = mf_f32(nd + 32 + (r*3+c)*4);
+        // +80: rotateX/Y/Z (Euler, skip for quaternion animation)
+        node->verticeCount = mf_u32(nd + 92);
+        if (node->verticeCount > 128) node->verticeCount = 128;
+        for (uint32_t vi = 0; vi < node->verticeCount; vi++)
+            node->verticeList[vi] = mf_u32(nd + 96 + vi*4);
+        // name at +608: Str31 (length byte then chars)
+        uint8_t nlen = MIN(nd[608], 31);
+        memcpy(node->name, nd + 609, nlen);
+        node->name[nlen] = 0;
+    }
+
+    // Skeleton points[] at offset 25,632 from skeleton start
+    // Each ShapePoint = Vector(12) + Normal(12) = 24 bytes
+    NSUInteger ptsOff   = (NSUInteger)sdpos + 25632;
+    NSUInteger ptsBytes = (NSUInteger)sdsz  - 25632;
+    skel->pointCount    = (uint32_t)(ptsBytes / 24);
+    if (ptsOff + skel->pointCount*24 > len) skel->pointCount = 0;
+
+    if (skel->pointCount > 0) {
+        skel->pts  = malloc(skel->pointCount * 12);
+        skel->nrms = malloc(skel->pointCount * 12);
+        const uint8_t *pd = b + ptsOff;
+        for (uint32_t pi = 0; pi < skel->pointCount; pi++) {
+            skel->pts [pi*3+0] = mf_f32(pd + pi*24 + 0);
+            skel->pts [pi*3+1] = mf_f32(pd + pi*24 + 4);
+            skel->pts [pi*3+2] = mf_f32(pd + pi*24 + 8);
+            skel->nrms[pi*3+0] = mf_f32(pd + pi*24 + 12);
+            skel->nrms[pi*3+1] = mf_f32(pd + pi*24 + 16);
+            skel->nrms[pi*3+2] = mf_f32(pd + pi*24 + 20);
+        }
+    }
+    model.skeleton = skel;
+
+    // ── 2. Build vertex-to-node mapping ──────────────────────────────────
+    if (skel->pointCount > 0) {
+        uint32_t *vtn = calloc(skel->pointCount, sizeof(uint32_t));
+        for (uint32_t ni = 0; ni < skel->nodeCount; ni++)
+            for (uint32_t vi = 0; vi < skel->nodes[ni].verticeCount; vi++) {
+                uint32_t idx = skel->nodes[ni].verticeList[vi];
+                if (idx < skel->pointCount) vtn[idx] = ni;
+            }
+        model.vtxNode = vtn;
+    }
+
+    // ── 3. Find matching shape & build animVertBuf ────────────────────────
+    NSInteger skelShapeIdx = -1;
+    for (NSUInteger si = 0; si < model.shapeCount; si++) {
+        if (memcmp(model.shapes[si].shape_id, skel->shapeID, 4) == 0) {
+            skelShapeIdx = (NSInteger)si; break;
+        }
+    }
+    if (skelShapeIdx < 0 && model.shapeCount > 0) skelShapeIdx = 0;
+    model.skelShapeIdx = skelShapeIdx;
+
+    // Recompute center/diameter from skeleton bind-pose world positions
+    if (skel->pointCount > 0) {
+        // Build bind-pose world matrices (parent index always < child index)
+        simd_float4x4 bworld[WR_MAX_NODES];
+        for (uint32_t ni = 0; ni < skel->nodeCount; ni++) {
+            float (*m)[3] = skel->nodes[ni].bindMat;
+            simd_float4x4 local = (simd_float4x4){ .columns = {
+                { m[0][0], m[0][1], m[0][2], 0.f },
+                { m[1][0], m[1][1], m[1][2], 0.f },
+                { m[2][0], m[2][1], m[2][2], 0.f },
+                { m[3][0], m[3][1], m[3][2], 1.f },
+            }};
+            uint32_t par = skel->nodes[ni].parentNode;
+            bworld[ni] = (par < skel->nodeCount) ? simd_mul(bworld[par], local) : local;
+        }
+        float bxn=FLT_MAX,byn=FLT_MAX,bzn=FLT_MAX;
+        float bxx=-FLT_MAX,byx=-FLT_MAX,bzx=-FLT_MAX;
+        for (uint32_t pi = 0; pi < skel->pointCount; pi++) {
+            uint32_t ni = model.vtxNode ? model.vtxNode[pi] : 0;
+            if (ni >= skel->nodeCount) ni = 0;
+            simd_float4 wp = simd_mul(bworld[ni],
+                (simd_float4){skel->pts[pi*3], skel->pts[pi*3+1], skel->pts[pi*3+2], 1.f});
+            bxn=fminf(bxn,wp.x); bxx=fmaxf(bxx,wp.x);
+            byn=fminf(byn,wp.y); byx=fmaxf(byx,wp.y);
+            bzn=fminf(bzn,wp.z); bzx=fmaxf(bzx,wp.z);
+        }
+        model.center   = simd_make_float3((bxn+bxx)/2, (byn+byx)/2, (bzn+bzx)/2);
+        model.diameter = fmaxf(fmaxf(bxx-bxn, byx-byn), bzx-bzn);
+    }
+
+    if (skelShapeIdx >= 0) {
+        id<MTLBuffer> src = model.vertexBufs[(NSUInteger)skelShapeIdx];
+        model.animVertBuf = [_device newBufferWithLength:src.length
+                                                 options:MTLResourceStorageModeShared];
+        memcpy(model.animVertBuf.contents, src.contents, src.length);
+    }
+
+    // ── 4. Find LpC1 or LpCd script ──────────────────────────────────────
+    const char *wantIds[2] = { "LpC1", "LpCd" };
+    uint32_t foundScrpIdx = UINT32_MAX;
+    for (int wi = 0; wi < 2 && foundScrpIdx == UINT32_MAX; wi++) {
+        for (uint32_t i = 0; i < tagCount; ++i) {
+            const uint8_t *e = b + eBase + i*24;
+            if (eBase + i*24 + 24 > len) break;
+            if (!mf_4cc(e+4, "scrp")) continue;
+            int32_t spos = mf_s32(e + 20);
+            if (spos < 0 || (NSUInteger)spos + 64 > len) continue;
+            if (mf_4cc(b + spos + 36, wantIds[wi])) { foundScrpIdx = i; break; }
+        }
+    }
+    if (foundScrpIdx == UINT32_MAX) {
+        NSLog(@"  No LpC1/LpCd script found in %@", @"");
+        return;
+    }
+
+    const uint8_t *scrpE    = b + eBase + foundScrpIdx*24;
+    uint8_t        scrpDepth = scrpE[0];
+    int32_t        scrpData  = mf_s32(scrpE + 20);
+    int32_t        scrpLen   = (scrpData >= 0 && (NSUInteger)scrpData+56 <= len)
+                               ? mf_s32(b + scrpData + 52) : 0;
+    char idBuf[5] = { b[scrpData+36], b[scrpData+37], b[scrpData+38], b[scrpData+39], 0 };
+
+    // Count anim children
+    uint32_t animChCount = 0;
+    for (uint32_t i = foundScrpIdx+1; i < tagCount; ++i) {
+        const uint8_t *e = b + eBase + i*24;
+        if (eBase + i*24 + 24 > len || e[0] <= scrpDepth) break;
+        if (mf_4cc(e+4, "<-->") && mf_4cc(e+8, "anim")) animChCount++;
+    }
+    if (animChCount == 0) return;
+
+    WRAnim *anim   = malloc(sizeof(WRAnim));
+    anim->length   = scrpLen;
+    anim->chCount  = 0;
+    anim->channels = calloc(animChCount, sizeof(WRAnimCh));
+
+    for (uint32_t i = foundScrpIdx+1; i < tagCount && anim->chCount < animChCount; ++i) {
+        const uint8_t *e = b + eBase + i*24;
+        if (eBase + i*24 + 24 > len || e[0] <= scrpDepth) break;
+        if (!mf_4cc(e+4, "<-->") || !mf_4cc(e+8, "anim")) continue;
+
+        int32_t apos = mf_s32(e + 20);
+        if (apos < 0 || (NSUInteger)apos + 24 > len) { anim->chCount++; continue; }
+
+        WRAnimCh *ch   = &anim->channels[anim->chCount];
+        ch->nodeIndex  = mf_u32(b + apos + 0);
+        ch->endTime    = mf_s32(b + apos + 12);
+        ch->eventCount = mf_u32(b + apos + 20);
+
+        uint32_t maxEv = (uint32_t)((len - (NSUInteger)apos - 24) / 32);
+        if (ch->eventCount > maxEv) ch->eventCount = maxEv;
+
+        ch->events = malloc(ch->eventCount * sizeof(LogoKF));
+        for (uint32_t k = 0; k < ch->eventCount; k++) {
+            const uint8_t *ep = b + apos + 24 + k*32;
+            LogoKF *kf = &ch->events[k];
+            kf->time_cs = mf_s32(ep);
+            kf->qw = mf_f32(ep+ 4);  // rotateX = qw
+            kf->qx = mf_f32(ep+ 8);  // rotateY = qx
+            kf->qy = mf_f32(ep+12);  // rotateZ = qy
+            kf->qz = mf_f32(ep+16);  // rotateW = qz
+            kf->px = mf_f32(ep+20);
+            kf->py = mf_f32(ep+24);
+            kf->pz = mf_f32(ep+28);
+        }
+        anim->chCount++;
+    }
+    model.animation = anim;
+    model.animStart = [NSDate date].timeIntervalSinceReferenceDate;
+    NSLog(@"  Skeleton: %u nodes, %u pts; anim '%s' %u channels, len=%d cs",
+          skel->nodeCount, skel->pointCount, idBuf, anim->chCount, anim->length);
+}
+
+// ── Per-frame CPU skinning ────────────────────────────────────────────────────
+// Evaluates skeleton animation at current time, writes animated positions/normals
+// into model.animVertBuf (UVs are preserved from the initial copy).
+
+- (void)updateAnimBufs:(MetaModel *)model {
+    WRSkeleton *skel = model.skeleton;
+    WRAnim     *anim = model.animation;
+    if (!skel || !anim || !model.animVertBuf) return;
+
+    // Animation time in centiseconds, looping
+    double elapsed = [NSDate date].timeIntervalSinceReferenceDate - model.animStart;
+    int32_t tick = (int32_t)(elapsed * 100.0);
+    if (anim->length > 0) {
+        tick = tick % anim->length;
+        if (tick < 0) tick += anim->length;
+    }
+
+    // Step 1: compute local matrices (bind-pose as fallback)
+    simd_float4x4 local[WR_MAX_NODES];
+    for (uint32_t ni = 0; ni < skel->nodeCount; ni++) {
+        float (*m)[3] = skel->nodes[ni].bindMat;
+        local[ni] = (simd_float4x4){ .columns = {
+            { m[0][0], m[0][1], m[0][2], 0.f },
+            { m[1][0], m[1][1], m[1][2], 0.f },
+            { m[2][0], m[2][1], m[2][2], 0.f },
+            { m[3][0], m[3][1], m[3][2], 1.f },
+        }};
+    }
+    // Step 2: override with animated local matrices
+    for (uint32_t ci = 0; ci < anim->chCount; ci++) {
+        WRAnimCh *ch = &anim->channels[ci];
+        if (ch->nodeIndex < skel->nodeCount)
+            local[ch->nodeIndex] = wr_ch_eval(ch, tick);
+    }
+    // Step 3: propagate parent→child (parent index always < child index in WR)
+    simd_float4x4 world[WR_MAX_NODES];
+    for (uint32_t ni = 0; ni < skel->nodeCount; ni++) {
+        uint32_t par = skel->nodes[ni].parentNode;
+        world[ni] = (par < skel->nodeCount) ? simd_mul(world[par], local[ni]) : local[ni];
+    }
+
+    // Step 4: transform skeleton points → write to animVertBuf
+    float   *vdata  = model.animVertBuf.contents;
+    uint32_t vcount = (uint32_t)(model.animVertBuf.length / 32);
+    uint32_t nv     = MIN(vcount, skel->pointCount);
+
+    for (uint32_t vi = 0; vi < nv; vi++) {
+        uint32_t ni = (model.vtxNode && vi < skel->pointCount) ? model.vtxNode[vi] : 0;
+        if (ni >= skel->nodeCount) ni = 0;
+        simd_float4x4 M = world[ni];
+
+        float bx = skel->pts[vi*3], by = skel->pts[vi*3+1], bz = skel->pts[vi*3+2];
+        simd_float4 wp = simd_mul(M, (simd_float4){bx, by, bz, 1.f});
+
+        float nx = skel->nrms[vi*3], ny = skel->nrms[vi*3+1], nz = skel->nrms[vi*3+2];
+        simd_float4 wn = simd_mul(M, (simd_float4){nx, ny, nz, 0.f});
+        float nl = sqrtf(wn.x*wn.x + wn.y*wn.y + wn.z*wn.z);
+        if (nl > 1e-6f) { wn.x/=nl; wn.y/=nl; wn.z/=nl; }
+
+        float *dst = vdata + vi*8;
+        dst[0]=wp.x; dst[1]=wp.y; dst[2]=wp.z;
+        dst[3]=wn.x; dst[4]=wn.y; dst[5]=wn.z;
+        // dst[6]/dst[7] = UV — left unchanged from initial copy
+    }
 }
 
 // ── Model pipeline (shared by all 3D model scenes) ────────────────────────────
@@ -1161,12 +1547,19 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     [cmd commit];
 }
 
-// ── Generic rotating-model renderer ───────────────────────────────────────────
+// ── Generic model renderer (rotation for non-animated; CPU skinning for animated) ──
 
 - (void)renderModel:(MetaModel *)model {
     if (!_modelPipeline || !model || model.shapeCount == 0) return;
 
-    model.angle += 0.008f;
+    BOOL hasAnim = (model.animation != nil && model.skeleton != nil);
+
+    // For animated characters: CPU-skin this frame; for static models: spin.
+    if (hasAnim) {
+        [self updateAnimBufs:model];
+    } else {
+        model.angle += 0.008f;
+    }
 
     id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
     if (!drawable) return;
@@ -1183,15 +1576,28 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     float aspect  = (float)(sz.width / sz.height);
     float camDist = model.diameter * 1.6f;
-    simd_float3 eye = simd_make_float3(model.center.x, model.center.y,
-                                        model.center.z + camDist);
-    simd_float4x4 proj  = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
-    simd_float4x4 view  = logo_mat_lookAt(eye, model.center, simd_make_float3(0,1,0));
-    simd_float4x4 rotY  = mat_rotY(model.angle);
-    simd_float4x4 toO   = mat_translate(-model.center.x, -model.center.y, -model.center.z);
-    simd_float4x4 fromO = mat_translate( model.center.x,  model.center.y,  model.center.z);
-    simd_float4x4 mdl   = simd_mul(simd_mul(fromO, rotY), toO);
-    simd_float4x4 mvp   = simd_mul(simd_mul(proj, view), mdl);
+
+    simd_float4x4 proj, view, mvp, rotY;
+    if (hasAnim) {
+        // Static front-facing camera: slightly elevated, looking at character center
+        simd_float3 ctr = model.center;
+        simd_float3 eye = simd_make_float3(ctr.x, ctr.y + model.diameter*0.1f,
+                                            ctr.z + camDist);
+        proj = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
+        view = logo_mat_lookAt(eye, ctr, simd_make_float3(0,1,0));
+        rotY = matrix_identity_float4x4;
+        mvp  = simd_mul(proj, view);
+    } else {
+        simd_float3 eye = simd_make_float3(model.center.x, model.center.y,
+                                            model.center.z + camDist);
+        proj = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
+        view = logo_mat_lookAt(eye, model.center, simd_make_float3(0,1,0));
+        rotY = mat_rotY(model.angle);
+        simd_float4x4 toO   = mat_translate(-model.center.x, -model.center.y, -model.center.z);
+        simd_float4x4 fromO = mat_translate( model.center.x,  model.center.y,  model.center.z);
+        simd_float4x4 mdl   = simd_mul(simd_mul(fromO, rotY), toO);
+        mvp = simd_mul(simd_mul(proj, view), mdl);
+    }
     ModelUni uni = { .mvp = mvp, .rotY = rotY };
 
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
@@ -1216,7 +1622,10 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
     for (NSUInteger i = 0; i < model.shapeCount; ++i) {
         NSData *key = [NSData dataWithBytes:model.shapes[i].tex_id length:4];
         id<MTLTexture> tex = model.texMap[key] ?: _whiteTex;
-        [enc setVertexBuffer:model.vertexBufs[i] offset:0 atIndex:0];
+        // Use animated buffer for the skeletal shape, static buffer for others
+        id<MTLBuffer> vbuf = (hasAnim && (NSInteger)i == model.skelShapeIdx && model.animVertBuf)
+                             ? model.animVertBuf : model.vertexBufs[i];
+        [enc setVertexBuffer:vbuf offset:0 atIndex:0];
         [enc setFragmentTexture:tex atIndex:0];
         [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                         indexCount:model.shapes[i].index_count
