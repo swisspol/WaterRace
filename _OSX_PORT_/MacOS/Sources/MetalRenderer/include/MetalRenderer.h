@@ -1,12 +1,7 @@
 #pragma once
 #import <AppKit/AppKit.h>
 
-// WaterRace Leah character renderer
-@interface LeahView : NSView
-- (instancetype)initWithFrame:(NSRect)frame;
-@end
-
-// WaterRace Logo Intro cinematic renderer
+// WaterRace renderer — Logo Intro cinematic + Leah character (press any key to switch)
 @interface LogoIntroView : NSView
 - (instancetype)initWithFrame:(NSRect)frame;
 @end
