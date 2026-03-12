@@ -39,8 +39,33 @@ static NSString * const kLogoShaders =
     "    return float4(c.rgb * (0.35f + 0.65f * d), c.a);\n"
     "}\n";
 
-// ── Uniform struct ─────────────────────────────────────────────────────────────
+// ── Uniform structs ────────────────────────────────────────────────────────────
 typedef struct { simd_float4x4 model; simd_float4x4 vp; } LogoUni;
+typedef struct { simd_float4x4 mvp;   simd_float4x4 rotY; } LeahUni;
+
+// ── Leah shaders ───────────────────────────────────────────────────────────────
+static NSString * const kLeahShaders =
+    @"#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct LVin  { float3 pos [[attribute(0)]]; float3 nrm [[attribute(1)]]; float2 uv [[attribute(2)]]; };\n"
+    "struct LVout { float4 pos [[position]]; float3 nrm; float2 uv; };\n"
+    "struct LUni  { float4x4 mvp; float4x4 rotY; };\n"
+    "vertex LVout leah_vert(LVin in [[stage_in]], constant LUni &u [[buffer(1)]]) {\n"
+    "    LVout o;\n"
+    "    o.pos = u.mvp  * float4(in.pos, 1.0);\n"
+    "    o.nrm = (u.rotY * float4(in.nrm, 0.0)).xyz;\n"
+    "    o.uv  = in.uv;\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 leah_frag(LVout in [[stage_in]],\n"
+    "                          texture2d<float> tex [[texture(0)]],\n"
+    "                          constant LUni &u [[buffer(1)]]) {\n"
+    "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "    float4 c = tex.sample(s, in.uv);\n"
+    "    float3 L = normalize(float3(0.6, 1.0, 0.8));\n"
+    "    float  d = max(0.0f, dot(normalize(in.nrm), L));\n"
+    "    return float4(c.rgb * (0.35f + 0.65f * d), c.a);\n"
+    "}\n";
 
 // ── Animation keyframe (32 bytes, matches logo.bin layout) ────────────────────
 typedef struct {
@@ -91,6 +116,21 @@ static simd_float4x4 logo_mat_lookAt(simd_float3 eye, simd_float3 ctr, simd_floa
         { r.z, u.z, f.z, 0 },
         { -simd_dot(r,eye), -simd_dot(u,eye), -simd_dot(f,eye), 1 },
     }};
+}
+
+// ── Additional matrix helpers ──────────────────────────────────────────────────
+
+static simd_float4x4 mat_rotY(float a) {
+    float c = cosf(a), s = sinf(a);
+    return (simd_float4x4){ .columns = {
+        {  c, 0, -s, 0 }, { 0, 1, 0, 0 }, { s, 0, c, 0 }, { 0, 0, 0, 1 },
+    }};
+}
+
+static simd_float4x4 mat_translate(float tx, float ty, float tz) {
+    simd_float4x4 m = matrix_identity_float4x4;
+    m.columns[3] = (simd_float4){ tx, ty, tz, 1 };
+    return m;
 }
 
 // ── Quaternion helpers ─────────────────────────────────────────────────────────
@@ -205,30 +245,36 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 }
 @property id<MTLDevice>               device;
 @property id<MTLCommandQueue>         commandQueue;
-@property id<MTLRenderPipelineState>  pipeline;
 @property id<MTLDepthStencilState>    depthState;
 @property id<MTLTexture>              depthTex;
 @property CAMetalLayer               *metalLayer;
 
-// Per-shape Metal buffers (parallel arrays, size = _shapeCount)
+// ── Logo scene ─────────────────────────────────────────────────────────────────
+@property id<MTLRenderPipelineState>  logoPipeline;
 @property NSUInteger                  shapeCount;
 @property NSMutableArray<id<MTLBuffer>> *vertexBufs;
 @property NSMutableArray<id<MTLBuffer>> *indexBufs;
-
-// Per-shape CPU data
 @property LogoShapeData              *shapes;    // malloc'd
 @property NSUInteger                  animCount;
 @property LogoAnimData               *anims;     // malloc'd
-
-// Textures keyed by 4-byte tex_id (stored as NSData → MTLTexture)
 @property NSMutableDictionary<NSData *, id<MTLTexture>> *texMap;
-@property id<MTLTexture>              whiteTex;  // fallback
-
-// Script info
+@property id<MTLTexture>              whiteTex;
 @property float                       sceneCx, sceneCy, sceneCz, sceneRadius;
 @property uint32_t                    scriptLengthCs;
 @property NSDate                     *startTime;
-@property BOOL                        animDone;
+
+// ── Leah scene ─────────────────────────────────────────────────────────────────
+@property id<MTLRenderPipelineState>  leahPipeline;
+@property id<MTLBuffer>               leahVertexBuf;
+@property id<MTLBuffer>               leahIndexBuf;
+@property id<MTLTexture>              leahTexture;
+@property uint32_t                    leahIndexCount;
+@property simd_float3                 leahCenter;
+@property float                       leahDiameter;
+@property float                       leahAngle;
+
+// ── Scene switch ───────────────────────────────────────────────────────────────
+@property BOOL                        showLeah;
 @end
 
 @implementation LogoIntroView
@@ -250,12 +296,20 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     _texMap       = [NSMutableDictionary new];
 
     if (![self loadAssets] || ![self buildPipeline]) return nil;
+    [self loadLeahAssets];   // best-effort; missing files = no Leah scene
+    [self buildLeahPipeline];
 
     _startTime = [NSDate date];
     CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);
     CVDisplayLinkSetOutputCallback(_displayLink, logoCB, (__bridge void *)self);
     CVDisplayLinkStart(_displayLink);
     return self;
+}
+
+- (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)keyDown:(NSEvent *)event {
+    _showLeah = YES;
 }
 
 - (CALayer *)makeBackingLayer { return [CAMetalLayer layer]; }
@@ -448,14 +502,67 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
     pd.vertexDescriptor                = vd;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.depthAttachmentPixelFormat      = MTLPixelFormatDepth32Float;
-    _pipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
-    if (!_pipeline) { NSLog(@"LogoIntro pipeline error: %@", err); return NO; }
+    _logoPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!_logoPipeline) { NSLog(@"LogoIntro pipeline error: %@", err); return NO; }
 
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
     dd.depthCompareFunction = MTLCompareFunctionLess;
     dd.depthWriteEnabled    = YES;
     _depthState = [_device newDepthStencilStateWithDescriptor:dd];
     return YES;
+}
+
+// ── Leah asset loading ────────────────────────────────────────────────────────
+
+- (void)loadLeahAssets {
+    NSString *cwd  = NSFileManager.defaultManager.currentDirectoryPath;
+    NSString *adir = [cwd stringByAppendingPathComponent:@"LeahAssets"];
+
+    NSData *bin = [NSData dataWithContentsOfFile:
+                   [adir stringByAppendingPathComponent:@"leah.bin"]];
+    if (!bin) { NSLog(@"Leah: leah.bin not found"); return; }
+
+    const uint8_t *b = bin.bytes;
+    size_t off = 0;
+    uint32_t vc, ic;
+    memcpy(&vc, b+off, 4); off += 4;
+    memcpy(&ic, b+off, 4); off += 4;
+    _leahIndexCount = ic;
+
+    float bbox[6];
+    memcpy(bbox, b+off, 24); off += 24;
+    _leahCenter  = simd_make_float3((bbox[0]+bbox[3])*.5f,
+                                     (bbox[1]+bbox[4])*.5f,
+                                     (bbox[2]+bbox[5])*.5f);
+    _leahDiameter = fmaxf(fmaxf(bbox[3]-bbox[0], bbox[4]-bbox[1]), bbox[5]-bbox[2]);
+
+    _leahVertexBuf = [_device newBufferWithBytes:b+off length:vc*32 options:0]; off += vc*32;
+    _leahIndexBuf  = [_device newBufferWithBytes:b+off length:ic*4  options:0];
+
+    _leahTexture = [self loadJPEG:[adir stringByAppendingPathComponent:@"leah_Tlea.jpg"]];
+}
+
+// ── Leah pipeline ─────────────────────────────────────────────────────────────
+
+- (void)buildLeahPipeline {
+    NSError *err = nil;
+    id<MTLLibrary> lib = [_device newLibraryWithSource:kLeahShaders options:nil error:&err];
+    if (!lib) { NSLog(@"Leah shader error: %@", err); return; }
+
+    MTLVertexDescriptor *vd = [MTLVertexDescriptor new];
+    vd.attributes[0].format = MTLVertexFormatFloat3; vd.attributes[0].offset =  0; vd.attributes[0].bufferIndex = 0;
+    vd.attributes[1].format = MTLVertexFormatFloat3; vd.attributes[1].offset = 12; vd.attributes[1].bufferIndex = 0;
+    vd.attributes[2].format = MTLVertexFormatFloat2; vd.attributes[2].offset = 24; vd.attributes[2].bufferIndex = 0;
+    vd.layouts[0].stride = 32;
+
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction                  = [lib newFunctionWithName:@"leah_vert"];
+    pd.fragmentFunction                = [lib newFunctionWithName:@"leah_frag"];
+    pd.vertexDescriptor                = vd;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    pd.depthAttachmentPixelFormat      = MTLPixelFormatDepth32Float;
+    _leahPipeline = [_device newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!_leahPipeline) NSLog(@"Leah pipeline error: %@", err);
 }
 
 // ── Render loop ───────────────────────────────────────────────────────────────
@@ -468,67 +575,55 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 }
 
 - (void)render {
+    if (_showLeah) { [self renderLeah]; return; }
+
     // ── Compute local animation time (centiseconds) ──
     NSTimeInterval elapsed = -[_startTime timeIntervalSinceNow];
-    int32_t localTime = (int32_t)(elapsed * 100.0);  // to centiseconds
-
-    // Loop the animation
-    if (_scriptLengthCs > 0 && localTime > (int32_t)_scriptLengthCs) {
+    int32_t localTime = (int32_t)(elapsed * 100.0);
+    if (_scriptLengthCs > 0 && localTime > (int32_t)_scriptLengthCs)
         localTime = localTime % (int32_t)_scriptLengthCs;
-    }
 
     // ── Evaluate animations → update shape model matrices ──
     for (NSUInteger i = 0; i < _animCount; ++i) {
         LogoAnimData *an = &_anims[i];
-        if (an->shape_idx < 0) continue;   // no matching shape (e.g. camr)
+        if (an->shape_idx < 0) continue;
         _shapes[an->shape_idx].model_mat = logo_eval_anim(an, localTime);
     }
 
-    // ── Find camr animation for camera eye (use last keyframe if past end) ──
+    // ── Camera: use camr animation translation as eye, look at scene center ──
     simd_float3 camEye  = simd_make_float3(_sceneCx, _sceneCy + _sceneRadius*0.4f,
                                             _sceneCz - _sceneRadius*3.0f);
     simd_float3 camLook = simd_make_float3(_sceneCx, _sceneCy, _sceneCz);
     for (NSUInteger i = 0; i < _animCount; ++i) {
         if (memcmp(_anims[i].target_id, "camr", 4) == 0) {
             simd_float4x4 cm = logo_eval_anim(&_anims[i], localTime);
-            // Use the translation column (col 3) as camera eye
             camEye = simd_make_float3(cm.columns[3].x, cm.columns[3].y, cm.columns[3].z);
-            // Keep the fixed look-at point
             break;
         }
     }
 
-    // ── Get drawable ──
     id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
     if (!drawable) return;
     CGSize sz = _metalLayer.drawableSize;
 
-    // ── Recreate depth texture if needed ──
     if (!_depthTex || _depthTex.width != (NSUInteger)sz.width
                    || _depthTex.height != (NSUInteger)sz.height) {
         MTLTextureDescriptor *dd = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
             width:(NSUInteger)sz.width height:(NSUInteger)sz.height mipmapped:NO];
-        dd.usage       = MTLTextureUsageRenderTarget;
-        dd.storageMode = MTLStorageModePrivate;
+        dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModePrivate;
         _depthTex = [_device newTextureWithDescriptor:dd];
     }
 
-    // ── View-projection matrix ──
-    // Original engine: near=0.06, far=60.0, zoom=kShapeCameraZoom=0.5
-    // WR zoom = tan(half_horizontal_FOV); fovY = 2*atan(zoom/aspect)
     float aspect = (float)(sz.width / sz.height);
-    float wrZoom = 0.5f;
-    float fovY   = 2.f * atanf(wrZoom / aspect);
-    simd_float4x4 proj = logo_mat_perspective(fovY, aspect, 0.06f, 60.f);
+    simd_float4x4 proj = logo_mat_perspective(2.f * atanf(0.5f / aspect), aspect, 0.06f, 60.f);
     simd_float4x4 view = logo_mat_lookAt(camEye, camLook, simd_make_float3(0,1,0));
     simd_float4x4 vp   = simd_mul(proj, view);
 
-    // ── Render pass ──
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
     pass.colorAttachments[0].texture     = drawable.texture;
     pass.colorAttachments[0].loadAction  = MTLLoadActionClear;
-    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1);
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     pass.depthAttachment.texture         = _depthTex;
     pass.depthAttachment.loadAction      = MTLLoadActionClear;
@@ -537,27 +632,20 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
 
     id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-
-    [enc setRenderPipelineState:_pipeline];
+    [enc setRenderPipelineState:_logoPipeline];
     [enc setDepthStencilState:_depthState];
     [enc setCullMode:MTLCullModeBack];
     [enc setFrontFacingWinding:MTLWindingClockwise];
 
-    // ── Draw each shape ──
     for (NSUInteger i = 0; i < _shapeCount; ++i) {
-        // Skip the camera model (it's at the camera position, looks wrong)
         if (memcmp(_shapes[i].shape_id, "camr", 4) == 0) continue;
-
         LogoUni uni = { .model = _shapes[i].model_mat, .vp = vp };
-
-        // Select texture
         id<MTLTexture> tex = _whiteTex;
         if (_shapes[i].tex_id[0] != 0xFF) {
             NSData *key = [NSData dataWithBytes:_shapes[i].tex_id length:4];
             id<MTLTexture> found = _texMap[key];
             if (found) tex = found;
         }
-
         [enc setVertexBuffer:_vertexBufs[i] offset:0 atIndex:0];
         [enc setVertexBytes:&uni  length:sizeof(uni) atIndex:1];
         [enc setFragmentBytes:&uni length:sizeof(uni) atIndex:1];
@@ -568,7 +656,67 @@ static CVReturn logoCB(CVDisplayLinkRef dl, const CVTimeStamp *now,
                        indexBuffer:_indexBufs[i]
                  indexBufferOffset:0];
     }
+    [enc endEncoding];
+    [cmd presentDrawable:drawable];
+    [cmd commit];
+}
 
+- (void)renderLeah {
+    if (!_leahPipeline || !_leahVertexBuf) return;
+
+    _leahAngle += 0.008f;
+
+    id<CAMetalDrawable> drawable = [_metalLayer nextDrawable];
+    if (!drawable) return;
+    CGSize sz = _metalLayer.drawableSize;
+
+    if (!_depthTex || _depthTex.width != (NSUInteger)sz.width
+                   || _depthTex.height != (NSUInteger)sz.height) {
+        MTLTextureDescriptor *dd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+            width:(NSUInteger)sz.width height:(NSUInteger)sz.height mipmapped:NO];
+        dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModePrivate;
+        _depthTex = [_device newTextureWithDescriptor:dd];
+    }
+
+    float aspect  = (float)(sz.width / sz.height);
+    float camDist = _leahDiameter * 1.6f;
+    simd_float3 eye = simd_make_float3(_leahCenter.x, _leahCenter.y,
+                                        _leahCenter.z + camDist);
+    simd_float4x4 proj  = logo_mat_perspective(M_PI / 4.0, aspect, 0.1f, 500.f);
+    simd_float4x4 view  = logo_mat_lookAt(eye, _leahCenter, simd_make_float3(0,1,0));
+    simd_float4x4 rotY  = mat_rotY(_leahAngle);
+    simd_float4x4 toO   = mat_translate(-_leahCenter.x, -_leahCenter.y, -_leahCenter.z);
+    simd_float4x4 fromO = mat_translate( _leahCenter.x,  _leahCenter.y,  _leahCenter.z);
+    simd_float4x4 model = simd_mul(simd_mul(fromO, rotY), toO);
+    simd_float4x4 mvp   = simd_mul(simd_mul(proj, view), model);
+    LeahUni uni = { .mvp = mvp, .rotY = rotY };
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor new];
+    pass.colorAttachments[0].texture     = drawable.texture;
+    pass.colorAttachments[0].loadAction  = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor  = MTLClearColorMake(0.08, 0.08, 0.12, 1);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    pass.depthAttachment.texture         = _depthTex;
+    pass.depthAttachment.loadAction      = MTLLoadActionClear;
+    pass.depthAttachment.clearDepth      = 1.0;
+    pass.depthAttachment.storeAction     = MTLStoreActionDontCare;
+
+    id<MTLCommandBuffer>        cmd = [_commandQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+    [enc setRenderPipelineState:_leahPipeline];
+    [enc setDepthStencilState:_depthState];
+    [enc setCullMode:MTLCullModeBack];
+    [enc setFrontFacingWinding:MTLWindingClockwise];
+    [enc setVertexBuffer:_leahVertexBuf  offset:0 atIndex:0];
+    [enc setVertexBytes:&uni  length:sizeof(uni) atIndex:1];
+    [enc setFragmentBytes:&uni length:sizeof(uni) atIndex:1];
+    [enc setFragmentTexture:_leahTexture atIndex:0];
+    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                    indexCount:_leahIndexCount
+                     indexType:MTLIndexTypeUInt32
+                   indexBuffer:_leahIndexBuf
+             indexBufferOffset:0];
     [enc endEncoding];
     [cmd presentDrawable:drawable];
     [cmd commit];

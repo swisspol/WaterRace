@@ -19,6 +19,7 @@ logoView.autoresizingMask = [.width, .height]
 window.contentView = logoView
 
 window.makeKeyAndOrderFront(nil)
+window.makeFirstResponder(logoView)
 app.activate(ignoringOtherApps: true)
 
 let mainMenu = NSMenu()
