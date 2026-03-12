@@ -451,7 +451,7 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
 
 @implementation LogoIntroView
 
-- (instancetype)initWithFrame:(NSRect)frame {
+- (instancetype)initWithFrame:(NSRect)frame mode:(nullable NSString *)mode {
     self = [super initWithFrame:frame];
     if (!self) return nil;
 
@@ -470,37 +470,36 @@ static simd_float4x4 wr_ch_eval(WRAnimCh *ch, int32_t t) {
     if (![self loadAssets] || ![self buildPipeline]) return nil;
     [self buildModelPipeline];
 
-    NSString *assetsDir = [NSFileManager.defaultManager.currentDirectoryPath
-                           stringByAppendingPathComponent:@"Assets"];
     NSMutableArray<MetaModel *> *loadedModels = [NSMutableArray new];
 
-    // Characters and Boats: loaded as 3D models
-    for (NSString *subdir in @[@"Characters", @"Boats"]) {
-        NSString *dir = [assetsDir stringByAppendingPathComponent:subdir];
-        NSArray<NSString *> *names = [[NSFileManager.defaultManager
-            contentsOfDirectoryAtPath:dir error:nil]
-            sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-        for (NSString *name in names) {
-            if ([name hasPrefix:@"."]) continue;
-            MetaModel *m = [self loadModelFromPath:[dir stringByAppendingPathComponent:name]];
-            if (m) [loadedModels addObject:m];
+    if (mode) {
+        NSString *assetsDir = [NSFileManager.defaultManager.currentDirectoryPath
+                               stringByAppendingPathComponent:@"Assets"];
+        if ([mode isEqualToString:@"levels"]) {
+            NSString *dir = [assetsDir stringByAppendingPathComponent:@"Levels"];
+            for (NSString *name in [[NSFileManager.defaultManager
+                    contentsOfDirectoryAtPath:dir error:nil]
+                    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
+                if ([name hasPrefix:@"."]) continue;
+                MetaModel *m = [self loadTerrainFromPath:[dir stringByAppendingPathComponent:name]];
+                if (m) [loadedModels addObject:m];
+            }
+        } else {
+            NSString *subdir = [mode isEqualToString:@"boats"] ? @"Boats" : @"Characters";
+            NSString *dir = [assetsDir stringByAppendingPathComponent:subdir];
+            for (NSString *name in [[NSFileManager.defaultManager
+                    contentsOfDirectoryAtPath:dir error:nil]
+                    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)]) {
+                if ([name hasPrefix:@"."]) continue;
+                MetaModel *m = [self loadModelFromPath:[dir stringByAppendingPathComponent:name]];
+                if (m) [loadedModels addObject:m];
+            }
         }
-    }
-
-    // Levels: loaded as terrain scenes
-    NSString *levelsDir = [assetsDir stringByAppendingPathComponent:@"Levels"];
-    NSArray<NSString *> *levelNames = [[NSFileManager.defaultManager
-        contentsOfDirectoryAtPath:levelsDir error:nil]
-        sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-    for (NSString *name in levelNames) {
-        if ([name hasPrefix:@"."]) continue;
-        MetaModel *m = [self loadTerrainFromPath:[levelsDir stringByAppendingPathComponent:name]];
-        if (m) [loadedModels addObject:m];
     }
 
     _models     = [loadedModels copy];
     _modelIndex = 0;
-    _scene      = 0;   // start with logo intro
+    _scene      = mode ? 1 : 0;  // viewer modes start on first model; nil = logo intro
 
     _startTime = [NSDate date];
     CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink);

@@ -5,16 +5,26 @@ import MetalRenderer
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 
+let validModes: Set<String> = ["characters", "boats", "levels"]
+let mode: String? = CommandLine.arguments.dropFirst().first.flatMap {
+    validModes.contains($0) ? $0 : nil
+}
+
+let titles = ["characters": "WaterRace – Characters",
+               "boats":      "WaterRace – Boats",
+               "levels":     "WaterRace – Levels"]
+let windowTitle = mode.flatMap { titles[$0] } ?? "WaterRace – Logo Intro"
+
 let window = NSWindow(
     contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
     styleMask: [.titled, .closable, .miniaturizable],
     backing: .buffered,
     defer: false
 )
-window.title = "WaterRace – Logo Intro"
+window.title = windowTitle
 window.center()
 
-let logoView = LogoIntroView(frame: window.contentView!.bounds)!
+let logoView = LogoIntroView(frame: window.contentView!.bounds, mode: mode)!
 logoView.autoresizingMask = [.width, .height]
 window.contentView = logoView
 

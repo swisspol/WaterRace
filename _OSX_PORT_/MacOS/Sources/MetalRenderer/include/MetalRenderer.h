@@ -1,7 +1,8 @@
 #pragma once
 #import <AppKit/AppKit.h>
 
-// WaterRace renderer — Logo Intro cinematic + Leah character (press any key to switch)
+// WaterRace renderer.
+// mode: nil = logo intro only; @"characters" / @"boats" / @"levels" = viewer.
 @interface LogoIntroView : NSView
-- (instancetype)initWithFrame:(NSRect)frame;
+- (instancetype)initWithFrame:(NSRect)frame mode:(nullable NSString *)mode;
 @end
