@@ -67,7 +67,7 @@ static NSString * const kLeahShaders =
     "    return float4(c.rgb * (0.35f + 0.65f * d), c.a);\n"
     "}\n";
 
-// ── Animation keyframe (32 bytes, matches logo.bin layout) ────────────────────
+// ── Animation keyframe ────────────────────────────────────────────────────────
 typedef struct {
     int32_t  time_cs;
     float    qw, qx, qy, qz;
@@ -79,9 +79,8 @@ typedef struct {
     uint8_t       shape_id[4];
     uint8_t       tex_id[4];
     uint32_t      index_count;
-    int32_t       tex_idx;         // index into _textures, -1 → white fallback
-    simd_float4x4 init_mat;        // from logo.bin (used if no animation)
-    simd_float4x4 model_mat;       // updated per frame
+    simd_float4x4 init_mat;    // initial pose (used before animation starts)
+    simd_float4x4 model_mat;   // updated per frame by animation
 } LogoShapeData;
 
 // ── Per-animation CPU data ─────────────────────────────────────────────────────
@@ -343,32 +342,6 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
 
 // ── Asset loading ──────────────────────────────────────────────────────────────
 
-- (id<MTLTexture>)loadJPEG:(NSString *)path {
-    NSURL *url = [NSURL fileURLWithPath:path];
-    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, nil);
-    if (!src) return nil;
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, nil);
-    CFRelease(src);
-    if (!img) return nil;
-
-    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    unsigned char *px = calloc(w * h * 4, 1);
-    CGContextRef cx = CGBitmapContextCreate(px, w, h, 8, w*4, cs,
-                          kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-    CGContextDrawImage(cx, CGRectMake(0,0,w,h), img);
-    CGContextRelease(cx); CGColorSpaceRelease(cs); CGImageRelease(img);
-
-    MTLTextureDescriptor *td = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-        width:w height:h mipmapped:NO];
-    id<MTLTexture> tex = [_device newTextureWithDescriptor:td];
-    [tex replaceRegion:MTLRegionMake2D(0,0,w,h)
-           mipmapLevel:0 withBytes:px bytesPerRow:w*4];
-    free(px);
-    return tex;
-}
-
 - (id<MTLTexture>)loadJPEGFromData:(NSData *)jpegData {
     CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)jpegData, nil);
     if (!src) return nil;
@@ -546,7 +519,6 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
         memcpy(sd->shape_id, sh + 296, 4);  // shape id at header +296
         memcpy(sd->tex_id,   sh + 200, 4);  // texture id at header +200
         sd->index_count = (uint32_t)tc * 3;
-        sd->tex_idx     = -1;
         // Init matrix: WR row-major [4][3] → Metal column-major 4x4
         float m[4][3];
         for (int r = 0; r < 4; r++)
@@ -642,14 +614,6 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
             break;
         }
     }
-    // Resolve shape tex_idx
-    for (uint32_t i = 0; i < _shapeCount; ++i) {
-        LogoShapeData *sd = &_shapes[i];
-        if (sd->tex_id[0] == 0xFF) continue;
-        NSData *key = [NSData dataWithBytes:sd->tex_id length:4];
-        if (_texMap[key]) sd->tex_idx = 0;
-    }
-
     // ── Scene bounds from final keyframe positions of non-camera shapes ────
     float cx = 0, cy = 0, cz = 0;
     NSUInteger posCount = 0;
@@ -686,8 +650,9 @@ static simd_float4x4 logo_eval_anim(LogoAnimData *anim, int32_t localTime)
         break;
     }
 
-    NSLog(@"LogoIntro: %u shapes, %u anims, script=%.1fs, scene=(%.1f,%.1f,%.1f) r=%.1f",
-          _shapeCount, _animCount, _scriptLengthCs/100.0, cx, cy, cz, _sceneRadius);
+    NSLog(@"LogoIntro: %lu shapes, %lu anims, script=%.1fs, scene=(%.1f,%.1f,%.1f) r=%.1f",
+          (unsigned long)_shapeCount, (unsigned long)_animCount,
+          _scriptLengthCs/100.0, cx, cy, cz, _sceneRadius);
     return YES;
 }
 
