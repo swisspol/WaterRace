@@ -36,7 +36,8 @@ swift build
 These are pure-Python (stdlib) offline exporters. Their outputs go to `_OSX_PORT_/` (`textures/` and `models/` are gitignored; `assets/*.glb`, `Interface/`, `Sounds/` are committed):
 - `extract_interface_sounds.py` — reads the `.rsrc_fork` files and writes `Interface/PICT_<id>.png|jpg` and `Sounds/*.wav`.
 - `extract_textures.py` + `decode_pict.py` (via `extract_all_textures.sh`) — writes MetaFile textures to `textures/`.
-- `metafile_to_gltf.py` (via `extract_all_assets.sh`) — writes `.glb` files to `assets/`. **Currently broken:** it imports `metafile_to_obj.py`, which was deleted in commit e1afe93 (`extract_all_models.sh` depends on it too). Restore it from git history (`git show e1afe93^:_OSX_PORT_/metafile_to_obj.py`) before running either.
+- `metafile_to_gltf.py` (via `extract_all_assets.sh`) — writes `.glb` files to `assets/`. It imports its parsers from `metafile_to_obj.py`, so don't delete that file. Despite its docstring, it writes the `.glb` to the **current directory**.
+- `metafile_to_obj.py` (via `extract_all_models.sh`) — writes OBJ meshes to `models/`.
 - The `*_all_*.sh` scripts expect `_OSX_PORT_/.venv/bin/python3`, which does not exist in the repo. Create it, or run with the system `python3`.
 
 The docstrings in `extract_textures.py` hold the most concise description of the MetaFile header/tag-table layout.
